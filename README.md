@@ -1,14 +1,21 @@
 # weavatrix-rust-refactor
 
+[![CI](https://github.com/Weavatrix/weavatrix-rust-refactor/actions/workflows/ci.yml/badge.svg)](https://github.com/Weavatrix/weavatrix-rust-refactor/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/weavatrix-rust-refactor.svg)](https://crates.io/crates/weavatrix-rust-refactor)
+[![docs.rs](https://docs.rs/weavatrix-rust-refactor/badge.svg)](https://docs.rs/weavatrix-rust-refactor)
+[![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+The protocol-independent refactor operation layer of the [Weavatrix ecosystem](https://weavatrix.com/ecosystem).
+
 Evidence-backed refactor operations for Weavatrix: plan production, transactional
 application, and rollback.
 
-This crate is to [`weavatrix-rust`](https://github.com/sergii-ziborov/weavatrix-rust)
+This crate is to [`weavatrix-rust`](https://github.com/Weavatrix/weavatrix-rust)
 what a writer is to a reader. It consumes the read-only evidence graph, produces
 `weavatrix.edit-plan.v1` envelopes, and applies them through
-[`weavatrix-worktree`](https://github.com/sergii-ziborov/weavatrix-worktree)'s
+[`weavatrix-worktree`](https://github.com/Weavatrix/weavatrix-worktree)'s
 crash-recoverable transaction. It owns no protocol: the MCP host
-[`weavatrix-refactor`](https://github.com/sergii-ziborov/weavatrix-refactor)
+[`weavatrix-refactor`](https://github.com/Weavatrix/weavatrix-refactor)
 composes this catalog with the read-only one.
 
 ```text

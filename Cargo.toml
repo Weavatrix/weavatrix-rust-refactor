@@ -1,11 +1,11 @@
-﻿[package]
+[package]
 name = "weavatrix-rust-refactor"
 version = "0.1.6"
 edition = "2024"
 rust-version = "1.89"
 description = "Evidence-backed refactor operations for Weavatrix: plan production, transactional application, and rollback"
 license = "MIT"
-repository = "https://github.com/sergii-ziborov/weavatrix-rust-refactor"
+repository = "https://github.com/Weavatrix/weavatrix-rust-refactor"
 homepage = "https://weavatrix.com"
 keywords = ["refactoring", "code-analysis", "rename", "transactional", "weavatrix"]
 categories = ["development-tools"]
