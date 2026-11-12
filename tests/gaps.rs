@@ -1,0 +1,475 @@
+//! The gaps that used to come back as `NOT_SUPPORTED` or `UNPROVEN`, probed together.
+//!
+//! Each case is the one that previously refused the whole tool. A skip when the graph misses a
+//! symbol would hide the gap again, so a missing node fails the test.
+
+use blazingly_json::{Value, json};
+use std::fs;
+use std::path::{Path, PathBuf};
+use weavatrix_rust::{NodeKind, RepositoryState, Weavatrix};
+use weavatrix_rust_refactor::operations::RefactorSession;
+
+fn repository(name: &str, files: &[(&str, &str)]) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("wvxr-gaps-{}-{name}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    for (path, contents) in files {
+        let full = root.join(path);
+        fs::create_dir_all(full.parent().expect("parent")).expect("directories");
+        fs::write(full, contents).expect("source");
+    }
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+    )
+    .expect("manifest");
+    fs::write(
+        root.join("package.json"),
+        "{\"name\":\"fixture\",\"version\":\"0.0.0\",\"type\":\"module\"}\n",
+    )
+    .expect("package");
+    root
+}
+
+fn open(root: &Path) -> Weavatrix {
+    Weavatrix::open(root).expect("repository opens")
+}
+
+fn status_of(value: &Value) -> &str {
+    value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+fn expect_status(value: &Value, status: &str) {
+    assert_eq!(status_of(value), status, "{value:?}");
+    assert_ne!(status, "NOT_SUPPORTED");
+    assert_ne!(status_of(value), "UNPROVEN", "{value:?}");
+}
+
+fn node_id(state: &RepositoryState, kind: &NodeKind, label: &str) -> String {
+    let found = state
+        .graph()
+        .nodes()
+        .iter()
+        .find(|node| node.kind == *kind && node.label.trim_end_matches("()") == label);
+    let Some(node) = found else {
+        let seen = state
+            .graph()
+            .nodes()
+            .iter()
+            .map(|node| format!("{:?} {}", node.kind, node.label))
+            .collect::<Vec<_>>();
+        panic!("missing {kind:?} {label}: {seen:?}");
+    };
+    node.id.as_str().to_owned()
+}
+
+fn apply(session: &RefactorSession, state: &RepositoryState, plan: &Value) {
+    let preview = session
+        .call(state, "apply_edit_plan", &json!({"plan": plan.clone()}))
+        .expect("preview");
+    expect_status(&preview, "PREVIEW_OK");
+    let token = preview
+        .get("confirmToken")
+        .and_then(Value::as_str)
+        .expect("token")
+        .to_owned();
+    let applied = session
+        .call(
+            state,
+            "apply_edit_plan",
+            &json!({"plan": plan, "mode": "apply", "confirm_token": token}),
+        )
+        .expect("apply");
+    expect_status(&applied, "APPLIED");
+}
+
+#[test]
+fn a_rust_signature_change_is_planned() {
+    let root = repository(
+        "sig",
+        &[(
+            "src/lib.rs",
+            "pub fn used(value: u32) -> u32 {\n    value\n}\n",
+        )],
+    );
+    let engine = open(&root);
+    let id = node_id(engine.state(), &NodeKind::Function, "used");
+    let answer = RefactorSession::read_only()
+        .call(
+            engine.state(),
+            "change_signature",
+            &json!({"symbol": id, "operation": {"kind": "add_parameter", "name": "extra"}}),
+        )
+        .expect("tool");
+    expect_status(&answer, "PLANNED");
+    let plan = format!("{:?}", answer.get("plan"));
+    assert!(plan.contains("extra: u32"), "{plan}");
+}
+
+#[test]
+fn a_rust_related_rename_previews_the_new_name() {
+    let root = repository(
+        "related",
+        &[(
+            "src/lib.rs",
+            "pub fn alpha(value: u32) -> u32 {\n    value\n}\n",
+        )],
+    );
+    let engine = open(&root);
+    let id = node_id(engine.state(), &NodeKind::Function, "alpha");
+    let answer = RefactorSession::read_only()
+        .call(
+            engine.state(),
+            "rename_related_symbols",
+            &json!({"renames": [{"symbol": id, "new_name": "first"}]}),
+        )
+        .expect("tool");
+    expect_status(&answer, "PREVIEW_OK");
+    assert!(answer.get("confirmToken").and_then(Value::as_str).is_some());
+    assert!(format!("{:?}", answer.get("plan")).contains("first"));
+}
+
+#[test]
+fn organize_imports_edits_rust_python_and_go_and_names_an_unknown_language() {
+    let root = repository(
+        "imports",
+        &[
+            (
+                "src/lib.rs",
+                "use crate::util::helper;\nuse std::io::Write;\n\nfn main() {}\n",
+            ),
+            (
+                "src/app.py",
+                "from x import A\nimport os\n\ndef run():\n    return os\n",
+            ),
+            (
+                "main.go",
+                "package main\nimport \"fmt\"\nimport _ \"embed\"\nimport \"os\"\nfunc main() { fmt.Println(1) }\n",
+            ),
+            ("App.kt", "import foo.Bar\n"),
+        ],
+    );
+    let engine = open(&root);
+    let state = engine.state().clone();
+    let session = RefactorSession::new(true);
+
+    let rust = session
+        .call(&state, "organize_imports", &json!({"file": "src/lib.rs"}))
+        .expect("tool");
+    expect_status(&rust, "PLANNED");
+    apply(&session, &state, rust.get("plan").expect("plan"));
+    let rust_after = fs::read_to_string(root.join("src/lib.rs")).expect("rust");
+    assert!(!rust_after.contains("helper"), "{rust_after}");
+    assert!(rust_after.contains("Write"), "{rust_after}");
+
+    let python = session
+        .call(&state, "organize_imports", &json!({"file": "src/app.py"}))
+        .expect("tool");
+    expect_status(&python, "PLANNED");
+    apply(&session, &state, python.get("plan").expect("plan"));
+    let python_after = fs::read_to_string(root.join("src/app.py")).expect("python");
+    assert!(!python_after.contains("from x"), "{python_after}");
+    assert!(python_after.contains("import os"), "{python_after}");
+
+    let go = session
+        .call(&state, "organize_imports", &json!({"file": "main.go"}))
+        .expect("tool");
+    expect_status(&go, "PLANNED");
+    apply(&session, &state, go.get("plan").expect("plan"));
+    let go_after = fs::read_to_string(root.join("main.go")).expect("go");
+    assert!(!go_after.contains("\"os\""), "{go_after}");
+    assert!(go_after.contains("_ \"embed\""), "{go_after}");
+    assert!(go_after.contains("\"fmt\""), "{go_after}");
+
+    let kotlin = session
+        .call(&state, "organize_imports", &json!({"file": "App.kt"}))
+        .expect("tool");
+    expect_status(&kotlin, "NO_UNUSED_IMPORTS");
+    assert!(kotlin.get("plan").is_none(), "{kotlin:?}");
+}
+
+#[test]
+fn bulk_replace_skips_a_comment_and_a_string() {
+    let root = repository(
+        "bulk",
+        &[(
+            "src/lib.rs",
+            "#[mark]\nfn mark() {}\n// mark\nconst S: &str = \"mark\";\n",
+        )],
+    );
+    let engine = open(&root);
+    let session = RefactorSession::read_only();
+    let answer = session
+        .call(
+            engine.state(),
+            "bulk_replace",
+            &json!({"pattern": "mark", "replacement": "tag"}),
+        )
+        .expect("tool");
+    expect_status(&answer, "PREVIEW");
+    assert_eq!(
+        answer.get("total").and_then(Value::as_u64),
+        Some(2),
+        "{answer:?}"
+    );
+    let with_trivia = session
+        .call(
+            engine.state(),
+            "bulk_replace",
+            &json!({"pattern": "mark", "replacement": "tag", "include_trivia": true}),
+        )
+        .expect("tool");
+    assert_eq!(
+        with_trivia.get("total").and_then(Value::as_u64),
+        Some(4),
+        "{with_trivia:?}"
+    );
+}
+
+#[test]
+fn delete_closure_refuses_a_repository_and_a_spanless_package() {
+    let root = repository(
+        "containers",
+        &[(
+            "src/service.js",
+            "import leftPad from \"left-pad\";\nexport const padded = leftPad(\"x\", 3);\n",
+        )],
+    );
+    let engine = open(&root);
+    let state = engine.state();
+    let session = RefactorSession::read_only();
+    let repository_id = state
+        .graph()
+        .nodes()
+        .iter()
+        .find(|node| node.kind == NodeKind::Repository)
+        .map(|node| node.id.as_str().to_owned())
+        .expect("repository node");
+    let blocked = session
+        .call(
+            state,
+            "delete_closure",
+            &json!({"symbol": repository_id, "scope": "exclusive"}),
+        )
+        .expect("tool");
+    expect_status(&blocked, "BLOCKED");
+
+    let package_id = state
+        .graph()
+        .nodes()
+        .iter()
+        .find(|node| node.kind == NodeKind::Package && node.span.is_none())
+        .map(|node| node.id.as_str().to_owned())
+        .expect("a spanless package");
+    let missing = session
+        .call(
+            state,
+            "delete_closure",
+            &json!({"symbol": package_id, "scope": "exclusive"}),
+        )
+        .expect("tool");
+    expect_status(&missing, "NOT_A_SYMBOL");
+}
+
+#[test]
+fn delete_closure_removes_an_unused_file_and_a_cross_file_handler() {
+    let root = repository(
+        "files",
+        &[(
+            "src/service.js",
+            "import { only } from \"./only.js\";\nconst app = { get(path, handler) { return handler; } };\napp.get(\"/only\", only);\nexport function other() { return 1; }\n",
+        )],
+    );
+    fs::write(
+        root.join("src/orphan.js"),
+        "export function orphan() { return 1; }\n",
+    )
+    .expect("orphan");
+    fs::write(
+        root.join("src/only.js"),
+        "export function only() {\n  return 1;\n}\n",
+    )
+    .expect("only");
+    let engine = open(&root);
+    let state = engine.state().clone();
+    let session = RefactorSession::new(true);
+    let orphan = node_id(&state, &NodeKind::File, "src/orphan.js");
+    let planned = session
+        .call(
+            &state,
+            "delete_closure",
+            &json!({"symbol": orphan, "scope": "exclusive"}),
+        )
+        .expect("tool");
+    expect_status(&planned, "PLANNED");
+    apply(&session, &state, planned.get("plan").expect("plan"));
+    assert!(!root.join("src/orphan.js").exists());
+    assert!(root.join("src/service.js").is_file());
+
+    let route = state
+        .graph()
+        .nodes()
+        .iter()
+        .find(|node| node.kind == NodeKind::Endpoint && node.label.contains("/only"))
+        .map(|node| node.id.as_str().to_owned())
+        .expect("route");
+    let route_plan = session
+        .call(
+            &state,
+            "delete_closure",
+            &json!({"symbol": route, "scope": "exclusive"}),
+        )
+        .expect("tool");
+    expect_status(&route_plan, "PLANNED");
+    apply(&session, &state, route_plan.get("plan").expect("plan"));
+    let service = fs::read_to_string(root.join("src/service.js")).expect("service");
+    let handler = fs::read_to_string(root.join("src/only.js")).expect("handler");
+    assert!(!service.contains("\"/only\""), "{service}");
+    assert!(service.contains("function other("), "{service}");
+    assert!(!handler.contains("function only("), "{handler}");
+}
+
+#[test]
+fn a_private_unused_symbol_is_safe_and_still_needs_review() {
+    let root = repository("ready", &[("src/lib.rs", "fn hidden() {}\n")]);
+    let engine = open(&root);
+    let id = node_id(engine.state(), &NodeKind::Function, "hidden");
+    let answer = RefactorSession::read_only()
+        .call(engine.state(), "delete_readiness", &json!({"symbol": id}))
+        .expect("tool");
+    expect_status(&answer, "OK");
+    assert_eq!(
+        answer.get("verdict").and_then(Value::as_str),
+        Some("REVIEW_REQUIRED")
+    );
+    assert_eq!(
+        answer.get("safe").and_then(Value::as_bool),
+        Some(true),
+        "{answer:?}"
+    );
+}
+
+#[test]
+fn edit_symbol_plans_a_rust_body() {
+    let root = repository(
+        "edit",
+        &[(
+            "src/lib.rs",
+            "pub fn used(value: u32) -> u32 {\n    value\n}\n",
+        )],
+    );
+    let engine = open(&root);
+    let id = node_id(engine.state(), &NodeKind::Function, "used");
+    let answer = RefactorSession::read_only()
+        .call(
+            engine.state(),
+            "edit_symbol",
+            &json!({
+                "symbol": id,
+                "operation": "replace_symbol_body",
+                "content": "pub fn used(value: u32) -> u32 { value + 1 }",
+            }),
+        )
+        .expect("tool");
+    expect_status(&answer, "PLANNED");
+    assert!(answer.get("plan").is_some(), "{answer:?}");
+}
+
+#[test]
+fn move_file_plans_the_filesystem_rename() {
+    let root = repository(
+        "move-file",
+        &[
+            ("src/core.js", "export const value = 1\n"),
+            ("src/main.js", "import {value} from './core.js'\n"),
+        ],
+    );
+    let engine = open(&root);
+    let answer = RefactorSession::read_only()
+        .call(
+            engine.state(),
+            "move_file",
+            &json!({"from": "src/core.js", "to": "src/deep/core.js"}),
+        )
+        .expect("tool");
+    expect_status(&answer, "PLANNED");
+    let plan = format!("{:?}", answer.get("plan"));
+    assert!(plan.contains("src/deep/core.js"), "{plan}");
+    assert!(!plan.contains("FILE_RENAME_NOT_INCLUDED"), "{plan}");
+}
+
+#[test]
+fn move_symbol_emits_an_edit_plan() {
+    let root = repository(
+        "move-symbol",
+        &[
+            ("src/lib.rs", "pub mod helper;\npub mod caller;\n"),
+            ("src/helper.rs", "pub fn helper() -> u32 { 1 }\n"),
+            (
+                "src/caller.rs",
+                "use crate::helper::helper;\npub fn run() -> u32 { helper() }\n",
+            ),
+        ],
+    );
+    let engine = open(&root);
+    let id = node_id(engine.state(), &NodeKind::Function, "helper");
+    let answer = RefactorSession::read_only()
+        .call(
+            engine.state(),
+            "move_symbol",
+            &json!({"symbol": id, "to_file": "src/caller.rs"}),
+        )
+        .expect("tool");
+    expect_status(&answer, "EVALUATED");
+    assert_eq!(
+        answer.get("fidelity").and_then(Value::as_str),
+        Some("PROJECTED_FROM_GRAPH_EDGES")
+    );
+    assert!(answer.get("plan").is_some(), "{answer:?}");
+}
+
+#[test]
+fn rename_apply_and_rollback_restore_the_bytes() {
+    let source = "pub fn alpha(value: u32) -> u32 {\n    value\n}\n";
+    let root = repository("round", &[("src/lib.rs", source)]);
+    let engine = open(&root);
+    let state = engine.state().clone();
+    let id = node_id(&state, &NodeKind::Function, "alpha");
+    let session = RefactorSession::new(true);
+    let preview = session
+        .call(
+            &state,
+            "rename_symbol",
+            &json!({"symbol": id, "new_name": "first"}),
+        )
+        .expect("tool");
+    expect_status(&preview, "PLANNED");
+    let token = preview
+        .get("confirmToken")
+        .and_then(Value::as_str)
+        .expect("token")
+        .to_owned();
+    let applied = session
+        .call(
+            &state,
+            "rename_symbol",
+            &json!({"symbol": id, "new_name": "first", "mode": "apply", "confirm_token": token}),
+        )
+        .expect("tool");
+    expect_status(&applied, "APPLIED");
+    assert!(
+        fs::read_to_string(root.join("src/lib.rs"))
+            .expect("after")
+            .contains("fn first")
+    );
+    let rolled = session
+        .call(&state, "rollback_last_apply", &json!({}))
+        .expect("tool");
+    expect_status(&rolled, "ROLLED_BACK");
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).expect("restored"),
+        source
+    );
+}
