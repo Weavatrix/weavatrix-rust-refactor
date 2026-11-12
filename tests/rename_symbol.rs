@@ -73,11 +73,23 @@ fn a_missing_argument_is_invalid_args() {
 #[test]
 fn an_invalid_new_name_is_refused_before_anything_is_planned() {
     let root = repository("badname", &FILES);
-    let answer = call(
-        &root,
-        &json!({"symbol": "src/core.rs#resolve_target", "new_name": "not a name"}),
-    );
-    assert_eq!(status(&answer), "INVALID_NEW_NAME");
+    let engine = Weavatrix::open(&root).expect("opens");
+    let id = engine
+        .state()
+        .graph()
+        .nodes()
+        .iter()
+        .find(|node| {
+            node.label.starts_with("resolve_target")
+                && node
+                    .span
+                    .as_ref()
+                    .is_some_and(|span| span.file == "src/core.rs")
+        })
+        .map(|node| node.id.as_str().to_owned())
+        .expect("resolve_target is in the graph");
+    let answer = call(&root, &json!({"symbol": id, "new_name": "not a name"}));
+    assert_eq!(status(&answer), "INVALID_NEW_NAME", "{answer:?}");
 }
 
 #[test]

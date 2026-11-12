@@ -236,6 +236,7 @@ pub(super) fn move_file(state: &RepositoryState, arguments: &Value) -> Value {
         );
     }
 
+    builder = builder.rename(from, to, &sha256_of(&source));
     let total = own.len() + importer.len();
     json!({
         "status": "PLANNED",
@@ -245,9 +246,8 @@ pub(super) fn move_file(state: &RepositoryState, arguments: &Value) -> Value {
         "importers": importers,
         "plan": builder.build(),
         "uncertainReferences": uncertain,
-        "warnings": ["FILE_RENAME_NOT_INCLUDED"],
-        "next": "apply the specifier edits with apply_edit_plan (preview -> confirm), then move \
-                 the file itself: weavatrix.edit-plan.v1 carries text edits only, so the rename \
-                 is a separate, deliberate step.",
+        "warnings": [],
+        "next": "apply with apply_edit_plan (preview -> confirm). The plan renames the file and \
+                 rewrites relative specifiers in the same transaction.",
     })
 }

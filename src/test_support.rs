@@ -19,7 +19,7 @@ fn fixture_root() -> PathBuf {
     fs::write(root.join("src/lib.rs"), "pub mod core;\npub mod caller;\n").expect("lib");
     fs::write(
         root.join("src/core.rs"),
-        "pub fn used(value: u32) -> u32 {\n    value + 1\n}\n\npub fn orphan() -> u32 {\n    0\n}\n",
+        "pub fn used(value: u32) -> u32 {\n    value + 1\n}\n\npub fn orphan() -> u32 {\n    0\n}\n\nfn hidden() -> u32 {\n    0\n}\n",
     )
     .expect("core");
     fs::write(

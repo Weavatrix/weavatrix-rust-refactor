@@ -27,10 +27,23 @@ enum Change {
     Add {
         name: String,
         default: Option<String>,
+        ty: Option<String>,
+        value: Option<String>,
     },
     Remove {
         index: usize,
     },
+}
+
+#[derive(Clone, Copy)]
+enum Style {
+    Js,
+    Python,
+    TypedColon,
+    Go,
+    Java,
+    CSharp,
+    Cpp,
 }
 
 /// A file parsed once, so the tokens are not rebuilt for every lookup in it.
@@ -86,6 +99,19 @@ fn call_lines(state: &RepositoryState, id: &str) -> BTreeMap<String, BTreeSet<u3
     super::rename_symbol::referencing_lines(state, id)
 }
 
+fn style_of(path: &str) -> Style {
+    let extension = path.rsplit_once('.').map_or("", |(_, extension)| extension);
+    match extension.to_ascii_lowercase().as_str() {
+        "py" => Style::Python,
+        "rs" | "kt" | "kts" => Style::TypedColon,
+        "go" => Style::Go,
+        "java" => Style::Java,
+        "cs" => Style::CSharp,
+        "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" => Style::Cpp,
+        _ => Style::Js,
+    }
+}
+
 /// The (line, byte column) of a byte offset, both 1-based.
 fn position_of(text: &str, offset: usize) -> (u32, u32) {
     let before = &text[..offset.min(text.len())];
@@ -131,6 +157,14 @@ fn change(arguments: &Value) -> Result<Change, Value> {
                     .get("default")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                ty: operation
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                value: operation
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
             })
         }
         Some("remove_parameter") => {
@@ -154,13 +188,72 @@ fn change(arguments: &Value) -> Result<Change, Value> {
     }
 }
 
+fn copied_type(style: Style, last: &str) -> Option<String> {
+    let found = match style {
+        Style::TypedColon => last.split_once(':').map(|(_, ty)| ty.trim()),
+        Style::Go => last.split_whitespace().next_back(),
+        Style::Java | Style::CSharp | Style::Cpp => last.split_whitespace().next(),
+        Style::Js | Style::Python => None,
+    }?;
+    (!found.is_empty()).then(|| found.to_owned())
+}
+
+fn declared_text(
+    style: Style,
+    name: &str,
+    default: Option<&str>,
+    explicit: Option<&str>,
+    last: Option<&str>,
+) -> String {
+    match style {
+        Style::Js | Style::Python => {
+            default.map_or_else(|| name.to_owned(), |value| format!("{name} = {value}"))
+        }
+        Style::TypedColon => {
+            let ty = explicit
+                .map(str::to_owned)
+                .or_else(|| last.and_then(|text| copied_type(style, text)))
+                .unwrap_or_else(|| "()".to_owned());
+            format!("{name}: {ty}")
+        }
+        Style::Go => {
+            let ty = explicit
+                .map(str::to_owned)
+                .or_else(|| last.and_then(|text| copied_type(style, text)))
+                .unwrap_or_else(|| "any".to_owned());
+            format!("{name} {ty}")
+        }
+        Style::Java | Style::Cpp => {
+            let ty = explicit
+                .map(str::to_owned)
+                .or_else(|| last.and_then(|text| copied_type(style, text)))
+                .unwrap_or_else(|| "Object".to_owned());
+            format!("{ty} {name}")
+        }
+        Style::CSharp => {
+            let ty = explicit
+                .map(str::to_owned)
+                .or_else(|| last.and_then(|text| copied_type(style, text)))
+                .unwrap_or_else(|| "object".to_owned());
+            format!("{ty} {name}")
+        }
+    }
+}
+
 /// The text that adds a parameter to a declaration, and where it goes.
-fn addition(list: &List, name: &str, default: Option<&str>) -> ((usize, usize), String) {
-    let declared = default.map_or_else(|| name.to_owned(), |value| format!("{name} = {value}"));
+fn addition(
+    list: &List,
+    name: &str,
+    default: Option<&str>,
+    style: Style,
+    explicit: Option<&str>,
+) -> ((usize, usize), String) {
+    let previous = list.items.last().map(|item| item.text.as_str());
+    let declared = declared_text(style, name, default, explicit, previous);
     list.items.last().map_or_else(
         // An empty list has nothing to append to, so the parentheses themselves are rewritten.
         || ((list.open, list.close + 1), format!("({declared})")),
-        |last| ((last.start, last.end), format!("{}, {declared}", last.text)),
+        |item| ((item.start, item.end), format!("{}, {declared}", item.text)),
     )
 }
 
@@ -185,35 +278,96 @@ struct Planned {
 /// Only the declaration changes. With a default the existing calls stay correct; without one
 /// they are each short an argument, and the value to pass is a decision rather than something
 /// that can be derived, so every proven call site is reported instead of edited.
-fn plan_add(target: &Target, builder: PlanBuilder, name: &str, default: Option<&str>) -> Planned {
-    let (range, text) = addition(target.parameters, name, default);
+fn plan_add(
+    target: &Target,
+    builder: PlanBuilder,
+    name: &str,
+    default: Option<&str>,
+    style: Style,
+    explicit: Option<&str>,
+    value: Option<&str>,
+) -> Planned {
+    let (range, text) = addition(target.parameters, name, default, style, explicit);
     let builder = replace(builder, &target.source.text, range, &text);
-    let uncertain = if default.is_some() {
-        Vec::new()
-    } else {
-        call_lines(target.state, target.id)
-            .into_iter()
-            .flat_map(|(file, lines)| {
-                lines
-                    .into_iter()
-                    .map(|line| {
-                        json!({
-                            "file": file,
-                            "line": line,
-                            "kind": "VALUE_REQUIRED",
-                            "reason": "the parameter has no default, so this call needs an \
-                                       argument that only you can choose",
-                        })
+    let calls_stay = matches!(style, Style::Js | Style::Python) && default.is_some();
+    if calls_stay {
+        return Planned {
+            builder,
+            call_sites: Vec::new(),
+            uncertain: Vec::new(),
+        };
+    }
+    if let Some(value) = value {
+        let (builder, call_sites, uncertain) = append_calls(target, builder, value);
+        return Planned {
+            builder,
+            call_sites,
+            uncertain,
+        };
+    }
+    let uncertain = call_lines(target.state, target.id)
+        .into_iter()
+        .flat_map(|(file, lines)| {
+            lines
+                .into_iter()
+                .map(|line| {
+                    json!({
+                        "file": file,
+                        "line": line,
+                        "kind": "VALUE_REQUIRED",
+                        "reason": "the parameter has no default, so this call needs an \
+                                   argument that only you can choose",
                     })
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    };
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
     Planned {
         builder,
         call_sites: Vec::new(),
         uncertain,
     }
+}
+
+fn append_calls(
+    target: &Target,
+    mut builder: PlanBuilder,
+    value: &str,
+) -> (PlanBuilder, Vec<Value>, Vec<Value>) {
+    let mut edited = Vec::new();
+    let mut uncertain = Vec::new();
+    for (path, lines) in call_lines(target.state, target.id) {
+        let Some(source) = Source::open(target.state.root(), &path) else {
+            uncertain.push(json!({"file": path, "kind": "SOURCE_UNAVAILABLE"}));
+            continue;
+        };
+        let code = source.code();
+        let mut opened = false;
+        for line in lines {
+            let Some(list) = list_at(&source, &code, target.name, line) else {
+                continue;
+            };
+            if list.items.iter().any(|item| item.spread) {
+                uncertain.push(json!({
+                    "file": path,
+                    "line": line,
+                    "kind": "SPREAD_ARGUMENT",
+                }));
+                continue;
+            }
+            let (range, text) = list.items.last().map_or_else(
+                || ((list.open, list.close + 1), format!("({value})")),
+                |item| ((item.start, item.end), format!("{}, {value}", item.text)),
+            );
+            if !opened {
+                builder = builder.file(&path, &sha256_of(&source.text));
+                opened = true;
+            }
+            builder = replace(builder, &source.text, range, &text);
+            edited.push(json!({"file": path, "line": line, "added": value}));
+        }
+    }
+    (builder, edited, uncertain)
 }
 
 /// Removes a parameter from the declaration and its argument from each proven call.
@@ -352,7 +506,17 @@ pub(super) fn change_signature(state: &RepositoryState, arguments: &Value) -> Va
         Change::Add {
             name: added,
             default,
-        } => Ok(plan_add(&target, builder, added, default.as_deref())),
+            ty,
+            value,
+        } => Ok(plan_add(
+            &target,
+            builder,
+            added,
+            default.as_deref(),
+            style_of(&path),
+            ty.as_deref(),
+            value.as_deref(),
+        )),
         Change::Remove { index } => plan_remove(&target, builder, *index),
     } {
         Ok(planned) => planned,
@@ -437,5 +601,34 @@ mod tests {
             1,
         );
         assert!(items.is_empty(), "{items:?}");
+    }
+
+    #[test]
+    fn a_rust_signature_copies_the_previous_parameter_type() {
+        let state = crate::test_support::fixture_state();
+        let Some(id) = state.graph().nodes().iter().find_map(|node| {
+            (node.label.trim_end_matches("()") == "used").then(|| node.id.as_str().to_owned())
+        }) else {
+            return;
+        };
+        let answer = super::change_signature(
+            &state,
+            &blazingly_json::json!({
+                "symbol": id,
+                "operation": {"kind": "add_parameter", "name": "extra"},
+            }),
+        );
+        assert_eq!(
+            answer.get("status").and_then(blazingly_json::Value::as_str),
+            Some("PLANNED"),
+            "{answer:?}"
+        );
+        let plan =
+            blazingly_json::to_string(answer.get("plan").unwrap_or(&blazingly_json::Value::Null))
+                .unwrap_or_default();
+        assert!(
+            plan.contains("extra: u32"),
+            "the added parameter must copy the previous type: {plan}"
+        );
     }
 }

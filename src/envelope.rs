@@ -92,7 +92,8 @@ pub fn read_envelope(plan: &Value) -> Result<EditPlan, EnvelopeError> {
         .get("files")
         .and_then(Value::as_array)
         .ok_or_else(|| EnvelopeError::invalid("plan: files must be an array"))?;
-    if files.is_empty() {
+    let has_paths = plan.get("renames").is_some() || plan.get("deletes").is_some();
+    if files.is_empty() && !has_paths {
         return Err(EnvelopeError::invalid("plan: files must not be empty"));
     }
     let mut parsed = Vec::with_capacity(files.len());
@@ -113,7 +114,23 @@ pub fn read_envelope(plan: &Value) -> Result<EditPlan, EnvelopeError> {
         }
         parsed.push(FileEdit::new(path, sha256, typed));
     }
-    Ok(EditPlan::new(operation, parsed))
+    let mut built = EditPlan::new(operation, parsed);
+    if let Some(renames) = plan.get("renames") {
+        built
+            .extensions
+            .insert("renames".to_owned(), renames.clone());
+    }
+    if let Some(deletes) = plan.get("deletes") {
+        built
+            .extensions
+            .insert("deletes".to_owned(), deletes.clone());
+    }
+    if built.files.is_empty() && built.extensions.is_empty() {
+        return Err(EnvelopeError::invalid(
+            "plan: files must not be empty unless the plan renames or deletes a path",
+        ));
+    }
+    Ok(built)
 }
 
 #[cfg(test)]

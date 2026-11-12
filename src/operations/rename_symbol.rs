@@ -384,6 +384,155 @@ impl Rename {
     }
 }
 
+fn route_path(label: &str) -> Option<&str> {
+    let path = label.split_once(' ').map_or(label, |(_, path)| path.trim());
+    path.starts_with('/').then_some(path)
+}
+
+fn next_path(old: &str, new_name: &str) -> String {
+    if let Some(path) = route_path(new_name) {
+        return path.to_owned();
+    }
+    if let Some(path) = new_name.trim().strip_prefix('/') {
+        return format!("/{path}");
+    }
+    match old.rsplit_once('/') {
+        Some((prefix, _)) => format!("{prefix}/{new_name}"),
+        None => format!("/{new_name}"),
+    }
+}
+
+fn line_text(source: &str, line: u32) -> Option<&str> {
+    source
+        .split('\n')
+        .nth(usize::try_from(line.saturating_sub(1)).ok()?)
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+}
+
+/// The route literal, including the following lines while the call's `(` stays open.
+fn find_literal(source: &str, line: u32, literal: &str) -> Option<(u32, u32, u32)> {
+    let mut number = line;
+    let mut depth = 0_i32;
+    let mut started = false;
+    for _ in 0..8 {
+        let text = line_text(source, number)?;
+        if let Some(index) = text.find(literal) {
+            let start = u32::try_from(index.saturating_add(1)).ok()?;
+            let end = u32::try_from(index.saturating_add(literal.len()).saturating_add(1)).ok()?;
+            return Some((number, start, end));
+        }
+        for character in text.chars() {
+            match character {
+                '(' => {
+                    depth += 1;
+                    started = true;
+                }
+                ')' if depth > 0 => depth -= 1,
+                _ => {}
+            }
+        }
+        if !started || depth <= 0 {
+            break;
+        }
+        number = number.saturating_add(1);
+    }
+    None
+}
+
+fn placed(
+    state: &RepositoryState,
+    file: &str,
+    line: u32,
+    before: &str,
+    after: String,
+) -> Result<Rename, Value> {
+    let Some(source) = read_source(state.root(), file) else {
+        return Err(json!({
+            "status": "SOURCE_UNAVAILABLE",
+            "reason": format!("{file} could not be read, so nothing was planned"),
+        }));
+    };
+    let Some((found_line, start_column, end_column)) = find_literal(&source, line, before) else {
+        return Err(super::stale_graph(file));
+    };
+    let (Ok(start), Ok(end)) = (
+        utf16_offset(&source, found_line, start_column),
+        utf16_offset(&source, found_line, end_column),
+    ) else {
+        return Err(super::stale_graph(file));
+    };
+    let mut files = BTreeMap::new();
+    files.insert(
+        file.to_owned(),
+        (
+            sha256_of(&source),
+            vec![Site {
+                line: found_line,
+                start,
+                end,
+            }],
+        ),
+    );
+    Ok(Rename {
+        old_name: before.to_owned(),
+        new_name: after,
+        files,
+        uncertain: Vec::new(),
+    })
+}
+
+fn route_rename(
+    state: &RepositoryState,
+    old_label: &str,
+    new_name: &str,
+    span: Option<&weavatrix_graph::SourceSpan>,
+) -> Result<Rename, Value> {
+    let Some(old_path) = route_path(old_label) else {
+        return literal_rename(state, old_label, new_name, span);
+    };
+    let new_path = next_path(old_path, new_name);
+    if old_path == new_path {
+        return Err(json!({
+            "status": "NO_CHANGE",
+            "reason": "the route already has that path",
+        }));
+    }
+    let Some(span) = span else {
+        return Err(json!({
+            "status": "NOT_A_SYMBOL",
+            "reason": "the endpoint has no source range, so its route literal was not rewritten",
+        }));
+    };
+    placed(state, &span.file, span.start.line, old_path, new_path)
+}
+
+fn literal_rename(
+    state: &RepositoryState,
+    old_label: &str,
+    new_name: &str,
+    span: Option<&weavatrix_graph::SourceSpan>,
+) -> Result<Rename, Value> {
+    if new_name.is_empty() || old_label == new_name {
+        return Err(json!({
+            "status": "NO_CHANGE",
+            "reason": "the symbol already has that text",
+        }));
+    }
+    let Some(span) = span else {
+        return Err(json!({
+            "status": "NOT_A_SYMBOL",
+            "reason": "the symbol has no source range, so its text was not rewritten",
+        }));
+    };
+    placed(
+        state,
+        &span.file,
+        span.start.line,
+        old_label,
+        new_name.to_owned(),
+    )
+}
+
 /// Finds every site one rename touches, or the refusal that stops it.
 ///
 /// Both entry points come through here, so a symbol that `rename_symbol` refuses is refused
@@ -394,12 +543,6 @@ pub(super) fn sites(
     symbol: &str,
     new_name: &str,
 ) -> Result<Rename, Value> {
-    if !is_identifier(new_name) {
-        return Err(json!({
-            "status": "INVALID_NEW_NAME",
-            "reason": format!("{new_name:?} is not a valid identifier"),
-        }));
-    }
     let Some(index) = resolve_symbol(state.graph(), symbol) else {
         return Err(super::not_found(state.graph(), symbol));
     };
@@ -407,15 +550,17 @@ pub(super) fn sites(
         return Err(super::not_found(state.graph(), symbol));
     };
     let old_name = node.label.trim_end_matches("()").to_owned();
-    if !is_identifier(&old_name) {
+    if node.kind == NodeKind::Endpoint || route_path(&old_name).is_some() {
+        return route_rename(state, &old_name, new_name, node.span.as_ref());
+    }
+    if !is_identifier(new_name) {
         return Err(json!({
-            "status": "NOT_SUPPORTED",
-            "reason": format!(
-                "the graph records this symbol as {:?}, which is not a plain identifier; rename \
-                 needs one to anchor its edits",
-                node.label
-            ),
+            "status": "INVALID_NEW_NAME",
+            "reason": format!("{new_name:?} is not a valid identifier"),
         }));
+    }
+    if !is_identifier(&old_name) {
+        return literal_rename(state, &old_name, new_name, node.span.as_ref());
     }
     if old_name == new_name {
         return Err(json!({"status": "NO_CHANGE", "reason": "the symbol already has that name"}));

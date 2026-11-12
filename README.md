@@ -35,10 +35,10 @@ Unicode-safe edit-plan validation and application.
 
 ## The contract is frozen, not re-derived
 
-The eleven tool names, their JSON schemas and all 47 result states were recorded
-from the shipping JavaScript implementation into
-[`contract/refactor-tools.v1.json`](contract/refactor-tools.v1.json). That file is
-compiled into the crate and is the **only** source of the tool catalog, so this
+The tool names, their JSON schemas and the result states live in
+[`contract/refactor-tools.v1.json`](contract/refactor-tools.v1.json). Contract
+version 2 adds `delete_closure` and keeps the version 1 result states. That file
+is compiled into the crate and is the **only** source of the tool catalog, so this
 implementation cannot drift from the schemas agents already depend on.
 
 An operation is conformant when it answers with a status from that file — never a
@@ -50,20 +50,21 @@ is a contract-version decision rather than an implementation detail.
 
 ## Operations
 
-All eleven are native. Dispatch has no fallback arm, so a tool added to the
+All twelve are native. Dispatch has no fallback arm, so a tool added to the
 contract fails to compile rather than answering "not supported" at run time.
 
 | Operation | Backend | What it proves |
 | --- | --- | --- |
 | `rename_symbol` | graph + lexical | The declaration, every site the graph proves calls or references it, and the import lines of files the graph proves import the declaring file |
 | `rename_related_symbols` | the same, merged | One transaction for several renames, with collision and contested-site detection; chains and swaps apply simultaneously rather than in sequence |
-| `change_signature` | graph + token-split lists | A parameter added or removed, with the argument at each proven call site |
+| `change_signature` | graph + token-split lists | A parameter added or removed in any indexed language. A typed language copies the previous parameter's type. With a default, existing calls stay; without one they are listed unless a call-site value is given |
 | `organize_imports` | occurrence count | Named JS/TS bindings whose identifier occurs once in the file |
-| `edit_symbol` | parser range | A symbol-anchored replacement or insertion, parse-gated for JS/TS |
-| `bulk_replace` | lexical | Literal or regex matches outside strings and comments |
-| `move_file` | specifier arithmetic | The file, plus the relative import specifiers that pointed at it |
-| `move_symbol` | graph | A move reviewed against its dependencies before anything is written |
-| `delete_readiness` | graph | Whether anything still depends on the symbol |
+| `edit_symbol` | declaration range | A symbol-anchored replacement or insertion. The end is the matching brace, the indent block, or the signature line. The plan warns that syntax was not checked |
+| `bulk_replace` | lexical | Literal or regex matches in indexed file text, including comments and strings |
+| `move_file` | specifier arithmetic | The filesystem rename and the relative import specifiers, in one transaction. A missing parent directory is created at apply and left in place on rollback |
+| `move_symbol` | graph | A cycle review plus an edit plan that cuts the declaration into the destination file |
+| `delete_readiness` | graph | Whether anything still depends on the symbol. A private symbol with no incoming use can be `safe: true`. The verdict stays `REVIEW_REQUIRED` and nothing is written |
+| `delete_closure` | graph | A deletion plan for a symbol or endpoint and the callees only it uses. `exclusive` keeps a shared handler and every other route; `connected` also takes direct referrers |
 | `apply_edit_plan` | `weavatrix-worktree` | Preview, single-use token, atomic write with retained contents |
 | `rollback_last_apply` | `weavatrix-worktree` | The previous contents, restored |
 
@@ -81,9 +82,10 @@ references. A same-named occurrence the graph does not vouch for is reported as 
 `UNPROVEN_OCCURRENCE` rather than edited, which is the whole difference between
 renaming a symbol and find-replacing a string.
 
-`NOT_SUPPORTED` survives only as a per-call answer where an engine cannot prove
-something about the input it was given — a symbol the graph records under a name
-that is not an identifier, for instance. It is never the answer for a whole tool.
+`NOT_SUPPORTED` survives only as a per-call answer, never as the answer for a
+whole tool. `delete_closure` still returns it for a file, module, package, or
+repository, and for a symbol that has no source span. A route label is renamed
+as a path literal. A missing span on a rename is `NOT_A_SYMBOL`.
 
 Outside JavaScript and TypeScript, `organize_imports` reports candidates and
 answers `UNPROVEN` instead of planning. `use std::io::Write` is used by calling

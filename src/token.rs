@@ -72,6 +72,14 @@ fn fingerprint(plan: &EditPlan) -> String {
             );
         }
     }
+    for (key, value) in &plan.extensions {
+        material.push('\u{4}');
+        material.push_str(key);
+        material.push('\u{5}');
+        if let Ok(encoded) = blazingly_json::to_string(value) {
+            material.push_str(&encoded);
+        }
+    }
     // A non-cryptographic digest is enough: this value never leaves the process and an attacker
     // who can call this server can call the planner too.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;

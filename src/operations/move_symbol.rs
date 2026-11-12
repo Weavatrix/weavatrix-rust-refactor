@@ -1,13 +1,13 @@
-//! What moving a declaration to another file would do to the dependency structure.
+//! What moving a declaration to another file would do, and the edit that does it.
 //!
-//! This one produces no edits on purpose. Relocating a declaration is a mechanical change any
-//! editor makes correctly; what an agent cannot see is whether the move introduces a cycle, and
-//! that is a property of the graph rather than of the text. So the answer is a projection —
-//! which edges would appear, which would vanish, and whether the result still has no cycles.
-//!
-//! It is a prediction from simulated edges, not a rebuild, and says so.
+//! The cycle verdict is a projection from simulated edges, not a rebuild. The plan is the
+//! mechanical half: cut the declaration out of its file and insert it at the end of `to_file`.
+//! An import line in the destination that names only this symbol is removed with it.
 
-use crate::evidence::declaring_file;
+use crate::coordinates::utf16_offset;
+use crate::declaration::locate;
+use crate::evidence::{declaring_file, read_source};
+use crate::plan::{PlanBuilder, sha256_of};
 use crate::resolve::resolve_symbol;
 use blazingly_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -167,6 +167,16 @@ pub(super) fn move_symbol(state: &RepositoryState, arguments: &Value) -> Value {
     } else {
         "WOULD_VIOLATE"
     };
+    let uncertain = importers
+        .iter()
+        .filter(|file| file.as_str() != to_file)
+        .map(|file| {
+            json!({
+                "file": file,
+                "reason": "this file depends on the symbol; its import path was not rewritten",
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
         "status": "EVALUATED",
         "verdict": verdict,
@@ -182,7 +192,137 @@ pub(super) fn move_symbol(state: &RepositoryState, arguments: &Value) -> Value {
             "newDependencies": new_dependencies,
         },
         "fidelity": "PROJECTED_FROM_GRAPH_EDGES",
-        "next": "this dry-run computes no byte edits. Move the declaration with your editor or \
-                 edit_symbol, then run verified_change phase=verify for the authoritative result.",
+        "plan": relocation_plan(state, node, &from, to_file),
+        "uncertainReferences": uncertain,
+        "next": "review the cycle verdict, then apply the plan with apply_edit_plan \
+                 (preview -> confirm). The plan cuts the declaration and inserts it into the \
+                 destination file.",
     })
+}
+
+/// Cuts the declaration and appends it to `to_file`.
+fn relocation_plan(
+    state: &RepositoryState,
+    node: &weavatrix_rust::Node,
+    from: &str,
+    to_file: &str,
+) -> Option<Value> {
+    let source = read_source(state.root(), from)?;
+    let line = node.span.as_ref().map_or(1, |span| span.start.line);
+    let name = node.label.trim_end_matches("()");
+    let range = locate(&source, from, name, line)?;
+    let mut end = range.end;
+    if source.as_bytes().get(end) == Some(&b'\n') {
+        end += 1;
+    }
+    let before = source.get(range.start..end)?.to_owned();
+    let declaration = source
+        .get(range.start..range.end)?
+        .trim_end_matches(['\n', '\r']);
+    let (start_line, start_column) = byte_position(&source, range.start)?;
+    let (end_line, end_column) = byte_position(&source, end)?;
+    let start_char = utf16_offset(&source, start_line, start_column).ok()?;
+    let end_char = utf16_offset(&source, end_line, end_column).ok()?;
+    let mut builder = PlanBuilder::new("move_symbol")
+        .file(from, &sha256_of(&source))
+        .edit(
+            start_line,
+            start_char,
+            end_line,
+            end_char,
+            before,
+            "",
+            "EXTRACTED",
+        );
+    let Some(destination) = read_source(state.root(), to_file) else {
+        return Some(builder.build());
+    };
+    builder = builder.file(to_file, &sha256_of(&destination));
+    builder = remove_sole_import(builder, &destination, name);
+    let (insert_line, insert_column) = byte_position(&destination, destination.len())?;
+    let insert_char = utf16_offset(&destination, insert_line, insert_column).ok()?;
+    let prefix = if destination.is_empty() || destination.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    Some(
+        builder
+            .edit(
+                insert_line,
+                insert_char,
+                insert_line,
+                insert_char,
+                "",
+                format!("{prefix}{declaration}\n"),
+                "EXTRACTED",
+            )
+            .build(),
+    )
+}
+
+fn byte_position(source: &str, offset: usize) -> Option<(u32, u32)> {
+    if offset > source.len() || !source.is_char_boundary(offset) {
+        return None;
+    }
+    let before = source.get(..offset)?;
+    let line = u32::try_from(before.matches('\n').count() + 1).ok()?;
+    let line_start = before.rfind('\n').map_or(0, |index| index + 1);
+    let column = u32::try_from(offset - line_start + 1).ok()?;
+    Some((line, column))
+}
+
+/// Deletes `use ...::name;` when that line imports nothing else.
+fn remove_sole_import(mut builder: PlanBuilder, source: &str, name: &str) -> PlanBuilder {
+    let mut offset = 0_usize;
+    for line in source.split_inclusive('\n') {
+        let end = offset + line.len();
+        if sole_import(line.trim(), name) {
+            builder = delete_bytes(builder, source, offset, end);
+        }
+        offset = end;
+    }
+    builder
+}
+
+fn sole_import(trimmed: &str, name: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix("use ") else {
+        return false;
+    };
+    if rest.contains('{') || rest.contains(',') {
+        return false;
+    }
+    let rest = rest.trim_end_matches(';').trim();
+    let imported = rest.rsplit("::").next().unwrap_or(rest).trim();
+    let imported = imported
+        .rsplit_once(" as ")
+        .map_or(imported, |(_, alias)| alias.trim());
+    imported == name
+}
+
+fn delete_bytes(builder: PlanBuilder, source: &str, start: usize, end: usize) -> PlanBuilder {
+    let Some(before) = source.get(start..end) else {
+        return builder;
+    };
+    let Some((start_line, start_column)) = byte_position(source, start) else {
+        return builder;
+    };
+    let Some((end_line, end_column)) = byte_position(source, end) else {
+        return builder;
+    };
+    let (Ok(start_char), Ok(end_char)) = (
+        utf16_offset(source, start_line, start_column),
+        utf16_offset(source, end_line, end_column),
+    ) else {
+        return builder;
+    };
+    builder.edit(
+        start_line,
+        start_char,
+        end_line,
+        end_char,
+        before,
+        "",
+        "EXTRACTED",
+    )
 }

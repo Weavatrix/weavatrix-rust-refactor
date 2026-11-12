@@ -149,8 +149,12 @@ fn the_projection_says_it_is_a_projection() {
         Some("PROJECTED_FROM_GRAPH_EDGES"),
         "a prediction from simulated edges must not read as a rebuild"
     );
-    assert!(
-        answer.get("plan").is_none(),
-        "move_symbol computes no byte edits"
+    assert_eq!(
+        answer
+            .get("plan")
+            .and_then(|plan| plan.get("schemaVersion"))
+            .and_then(Value::as_str),
+        Some("weavatrix.edit-plan.v1"),
+        "move_symbol emits the plan that cuts the declaration: {answer:?}"
     );
 }

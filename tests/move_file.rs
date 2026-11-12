@@ -109,15 +109,17 @@ fn the_rename_itself_is_declared_as_a_separate_step() {
         &root,
         &json!({"from": "src/core.js", "to": "src/deep/core.js"}),
     );
-    let warnings = answer
-        .get("warnings")
+    let renames = answer
+        .get("plan")
+        .and_then(|plan| plan.get("renames"))
         .and_then(Value::as_array)
-        .expect("warnings");
+        .expect("renames");
     assert!(
-        warnings
-            .iter()
-            .any(|warning| warning.as_str() == Some("FILE_RENAME_NOT_INCLUDED")),
-        "a plan of text edits must not read as if it moved the file"
+        renames.iter().any(|rename| {
+            rename.get("from").and_then(Value::as_str) == Some("src/core.js")
+                && rename.get("to").and_then(Value::as_str) == Some("src/deep/core.js")
+        }),
+        "the plan must rename the file in the same transaction, got {renames:?}"
     );
 }
 
@@ -201,18 +203,23 @@ fn the_moved_file_own_specifiers_are_rewritten_for_the_new_directory() {
         .and_then(Value::as_str)
         .expect("token")
         .to_owned();
-    session
+    let applied = session
         .call(
             &state,
             "apply_edit_plan",
             &json!({"plan": plan, "mode": "apply", "confirm_token": token}),
         )
         .expect("declared tool");
+    assert_eq!(status(&applied), "APPLIED", "{applied:?}");
 
-    let contents = fs::read_to_string(root.join("src/main.js")).expect("moved file");
+    let contents = fs::read_to_string(root.join("src/deep/main.js")).expect("moved file");
     assert!(
         contents.contains("'../core.js'"),
         "the moved file must climb out of its new directory, got {contents:?}"
+    );
+    assert!(
+        !root.join("src/main.js").exists(),
+        "the old path must be gone"
     );
 }
 

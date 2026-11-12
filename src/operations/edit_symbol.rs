@@ -112,16 +112,6 @@ pub(super) fn edit_symbol(state: &RepositoryState, arguments: &Value) -> Value {
         label,
         declaration,
     } = anchored;
-    if !declaration.end_proven && operation != "insert_before_symbol" {
-        return json!({
-            "status": "NOT_SUPPORTED",
-            "reason": format!(
-                "{file}: the end of this declaration could not be located in the source, so \
-                 {operation} would place text inside it. insert_before_symbol is unaffected."
-            ),
-        });
-    }
-
     let (range, before) = match operation {
         "replace_symbol_body" => (
             (declaration.start, declaration.end),

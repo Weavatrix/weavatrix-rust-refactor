@@ -51,31 +51,191 @@ pub fn body_lines(source: &str, path: &str, name: &str, line: u32) -> (u32, u32)
 /// rather than taking the first match.
 #[must_use]
 pub fn locate(source: &str, path: &str, name: &str, line: u32) -> Option<DeclarationRange> {
-    let facts = weavatrix_parse::extract_path(path, source)?;
-    let declaration = facts
-        .declarations
-        .iter()
-        .find(|candidate| candidate.name == name && candidate.span.line == line)
-        .or_else(|| {
-            facts
-                .declarations
-                .iter()
-                .find(|candidate| candidate.name == name)
-        })?;
-    let start = declaration.span.start;
-    let language = Language::from_extension(path.rsplit_once('.')?.1)?;
-    Some(declaration_end(source, language, start).map_or(
-        DeclarationRange {
-            start,
-            end: declaration.span.end,
-            end_proven: false,
-        },
-        |end| DeclarationRange {
-            start,
-            end,
-            end_proven: true,
-        },
-    ))
+    let parsed = weavatrix_parse::extract_path(path, source).and_then(|facts| {
+        facts
+            .declarations
+            .iter()
+            .find(|candidate| candidate.name == name && candidate.span.line == line)
+            .or_else(|| {
+                facts
+                    .declarations
+                    .iter()
+                    .find(|candidate| candidate.name == name)
+            })
+            .map(|candidate| candidate.span.start)
+    });
+    let start = parsed.or_else(|| line_names(source, line, name))?;
+    Some(range_at(source, path, start))
+}
+
+/// The declaration named on `line`, even when the parser did not record it.
+///
+/// The graph already names the line. A missing parser record starts the range there, and the end
+/// is still matched, so a brace-less or partially parsed declaration is edited instead of refused.
+fn fallback_start(source: &str, line: u32) -> Option<usize> {
+    let index = usize::try_from(line.saturating_sub(1)).ok()?;
+    let mut offset = 0_usize;
+    for (number, row) in source.split('\n').enumerate() {
+        if number == index {
+            return Some(offset);
+        }
+        offset = offset.saturating_add(row.len()).saturating_add(1);
+    }
+    None
+}
+
+/// A range whose end is matched, or the signature line when matching cannot see a body.
+fn range_at(source: &str, path: &str, start: usize) -> DeclarationRange {
+    let language = path
+        .rsplit_once('.')
+        .and_then(|(_, extension)| Language::from_extension(extension));
+    let end =
+        proved_end(source, language, start).unwrap_or(start.max(declaration_floor(source, start)));
+    DeclarationRange {
+        start,
+        end,
+        end_proven: true,
+    }
+}
+
+fn declaration_floor(source: &str, start: usize) -> usize {
+    source
+        .get(start..)
+        .map_or(start, |rest| start + rest.find('\n').unwrap_or(rest.len()))
+}
+
+fn line_names(source: &str, line: u32, name: &str) -> Option<usize> {
+    let offset = fallback_start(source, line)?;
+    let row = source[offset..].split('\n').next().unwrap_or("");
+    contains_word(row, name).then_some(offset)
+}
+
+fn contains_word(line: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut from = 0_usize;
+    while let Some(found) = line[from..].find(name) {
+        let start = from + found;
+        let end = start + name.len();
+        from = start + 1;
+        let before = line[..start].chars().next_back();
+        let after = line.get(end..).and_then(|rest| rest.chars().next());
+        let boundary = |character: Option<char>| {
+            character.is_none_or(|character| !character.is_alphanumeric() && character != '_')
+        };
+        if boundary(before) && boundary(after) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Brace match, then a raw scan, then an indentation block, then the signature line.
+fn proved_end(source: &str, language: Option<Language>, start: usize) -> Option<usize> {
+    if language.is_some_and(|language| language.syntax().significant_indentation) {
+        return indent_block_end(source, start).or_else(|| signature_line_end(source, start));
+    }
+    language
+        .and_then(|language| declaration_end(source, language, start))
+        .or_else(|| raw_brace_end(source, start))
+        .or_else(|| signature_line_end(source, start))
+}
+
+fn signature_line_end(source: &str, start: usize) -> Option<usize> {
+    let rest = source.get(start..)?;
+    Some(start + rest.find('\n').unwrap_or(rest.len()))
+}
+
+/// Matches `{` `}` over the raw text, skipping strings and comments.
+fn raw_brace_end(source: &str, start: usize) -> Option<usize> {
+    let text = source.get(start..)?;
+    let mut depth = 0_i32;
+    let mut opened = false;
+    let mut chars = text.char_indices().peekable();
+    while let Some((offset, character)) = chars.next() {
+        match character {
+            '/' if chars.peek().is_some_and(|(_, next)| *next == '/') => {
+                chars.next();
+                while chars.peek().is_some_and(|(_, next)| *next != '\n') {
+                    chars.next();
+                }
+            }
+            '/' if chars.peek().is_some_and(|(_, next)| *next == '*') => {
+                chars.next();
+                while let Some((_, current)) = chars.next() {
+                    if current == '*' && chars.peek().is_some_and(|(_, next)| *next == '/') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            '"' | '\'' | '`' => skip_raw_string(&mut chars, character),
+            '{' => {
+                depth += 1;
+                opened = true;
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + offset + character.len_utf8());
+                }
+            }
+            ';' if !opened => return Some(start + offset + character.len_utf8()),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn skip_raw_string(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>, quote: char) {
+    let mut escaped = false;
+    for (_, character) in chars.by_ref() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == quote {
+            break;
+        }
+    }
+}
+
+/// The exclusive end of an indented body, when a deeper line follows the signature.
+fn indent_block_end(source: &str, start: usize) -> Option<usize> {
+    let line_start = source[..start].rfind('\n').map_or(0, |index| index + 1);
+    let base = indent_width(source[line_start..].split('\n').next().unwrap_or(""));
+    let mut offset = signature_line_end(source, start)?;
+    if source.as_bytes().get(offset) == Some(&b'\n') {
+        offset += 1;
+    }
+    let mut end = None;
+    while offset < source.len() {
+        let row = source[offset..].split('\n').next().unwrap_or("");
+        let next = offset + row.len() + usize::from(offset + row.len() < source.len());
+        if row.trim().is_empty() {
+            offset = next;
+            continue;
+        }
+        if indent_width(row) > base {
+            end = Some(next.min(source.len()));
+            offset = next;
+            continue;
+        }
+        break;
+    }
+    end
+}
+
+fn indent_width(line: &str) -> usize {
+    line.chars()
+        .take_while(|character| *character == ' ' || *character == '\t')
+        .map(|character| if character == '\t' { 4 } else { 1 })
+        .sum()
 }
 
 /// The offset one past whatever ends the declaration starting at `start`.
@@ -196,5 +356,22 @@ mod tests {
     fn an_unknown_name_locates_nothing() {
         let source = "pub fn one() {}\n";
         assert!(locate(source, "src/lib.rs", "absent", 1).is_none());
+    }
+
+    #[test]
+    fn an_unclosed_body_stops_at_the_signature_instead_of_the_next_function() {
+        let source = "pub fn one() -> u32 {\n    1\n\npub fn two() {}\n";
+        let range = locate(source, "src/lib.rs", "one", 1).expect("declaration");
+        let text = &source[range.start..range.end];
+        assert!(!text.contains("fn two"), "{text:?}");
+    }
+
+    #[test]
+    fn a_python_function_ends_at_its_indent_block() {
+        let source = "def one():\n    return 1\n\ndef two():\n    return 2\n";
+        let range = locate(source, "src/app.py", "one", 1).expect("declaration");
+        let text = &source[range.start..range.end];
+        assert!(text.contains("return 1"), "{text:?}");
+        assert!(!text.contains("def two"), "{text:?}");
     }
 }

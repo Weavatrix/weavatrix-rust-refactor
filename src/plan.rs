@@ -18,6 +18,10 @@ pub struct PlanBuilder {
     operation: String,
     files: Vec<(String, String, Vec<Value>)>,
     index: BTreeMap<String, usize>,
+    /// The file `edit` writes. Reopening a path selects it again.
+    current: Option<usize>,
+    renames: Vec<Value>,
+    deletes: Vec<Value>,
 }
 
 impl PlanBuilder {
@@ -28,6 +32,9 @@ impl PlanBuilder {
             operation: operation.into(),
             files: Vec::new(),
             index: BTreeMap::new(),
+            current: None,
+            renames: Vec::new(),
+            deletes: Vec::new(),
         }
     }
 
@@ -37,11 +44,32 @@ impl PlanBuilder {
     /// same "before" hash and the second would be applied to bytes the first already changed.
     #[must_use]
     pub fn file(mut self, path: &str, sha256: &str) -> Self {
-        if !self.index.contains_key(path) {
-            self.index.insert(path.to_owned(), self.files.len());
-            self.files
-                .push((path.to_owned(), sha256.to_owned(), Vec::new()));
+        if let Some(&existing) = self.index.get(path) {
+            self.current = Some(existing);
+            return self;
         }
+        self.index.insert(path.to_owned(), self.files.len());
+        self.files
+            .push((path.to_owned(), sha256.to_owned(), Vec::new()));
+        self.current = Some(self.files.len() - 1);
+        self
+    }
+
+    /// Records a filesystem rename. Text edits on `from` travel with the rename.
+    #[must_use]
+    pub fn rename(mut self, from: &str, to: &str, sha256: &str) -> Self {
+        self.renames.push(json!({
+            "from": from,
+            "to": to,
+            "sha256": sha256,
+        }));
+        self
+    }
+
+    /// Records a filesystem delete of one exact file.
+    #[must_use]
+    pub fn delete_path(mut self, path: &str, sha256: &str) -> Self {
+        self.deletes.push(json!({"path": path, "sha256": sha256}));
         self
     }
 
@@ -58,8 +86,8 @@ impl PlanBuilder {
         after: impl Into<String>,
         provenance: &str,
     ) -> Self {
-        if let Some((_, _, edits)) = self.files.last_mut() {
-            edits.push(json!({
+        if let Some(current) = self.current {
+            self.files[current].2.push(json!({
                 "startLine": start_line,
                 "startChar": start_char,
                 "endLine": end_line,
@@ -75,13 +103,15 @@ impl PlanBuilder {
     /// Whether anything would actually be written.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.files.iter().all(|(_, _, edits)| edits.is_empty())
+        self.renames.is_empty()
+            && self.deletes.is_empty()
+            && self.files.iter().all(|(_, _, edits)| edits.is_empty())
     }
 
     /// Finishes the envelope.
     #[must_use]
     pub fn build(self) -> Value {
-        json!({
+        let mut plan = json!({
             "schemaVersion": "weavatrix.edit-plan.v1",
             "operation": self.operation,
             "files": self.files.into_iter()
@@ -92,7 +122,14 @@ impl PlanBuilder {
                     "edits": edits,
                 }))
                 .collect::<Vec<_>>(),
-        })
+        });
+        if !self.renames.is_empty() {
+            plan["renames"] = Value::Array(self.renames);
+        }
+        if !self.deletes.is_empty() {
+            plan["deletes"] = Value::Array(self.deletes);
+        }
+        plan
     }
 }
 

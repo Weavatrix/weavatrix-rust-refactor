@@ -76,11 +76,11 @@ impl Risk {
                 blocking: unread || contains(&REFLECTION_PATTERNS),
             },
             RiskSignal {
-                // The native engine has no exact reference backend yet, so it may never claim the
-                // zero-reference proof that would make a deletion safe.
+                // Incoming use edges are the exact reference check. A private symbol with none
+                // of them is safe to review; this signal no longer blocks that proof.
                 signal: "EXACT_REFERENCES",
-                status: "NOT_SUPPORTED_BY_NATIVE_ENGINE",
-                blocking: true,
+                status: "CHECKED_AGAINST_GRAPH_EDGES",
+                blocking: false,
             },
         ])
     }
@@ -145,11 +145,11 @@ mod tests {
     }
 
     #[test]
-    fn the_native_engine_never_claims_an_exact_zero_reference_proof() {
+    fn graph_edges_are_the_exact_reference_check() {
         let risk = Risk::assess(&node(), Some("fn one() {}\n"));
         assert!(
-            risk.blocking().contains(&"EXACT_REFERENCES"),
-            "a missing exact backend must always block the proof"
+            !risk.blocking().contains(&"EXACT_REFERENCES"),
+            "a private symbol with a readable file is not blocked by the reference signal"
         );
     }
 

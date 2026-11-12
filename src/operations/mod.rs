@@ -1,16 +1,16 @@
 //! The refactor operation surface.
 //!
-//! Dispatch is total and every arm is a native engine — all eleven of the frozen tools answer
+//! Dispatch is total and every arm is a native engine — all twelve of the frozen tools answer
 //! for themselves, and the match has no fallback arm, so adding a tool to the contract fails to
 //! compile rather than quietly returning "not supported" at run time.
 //!
-//! `NOT_SUPPORTED` survives as a per-call answer where an engine genuinely cannot prove
-//! something about the input it was given — a symbol the graph records under a name that is not
-//! an identifier, for instance. It is never the answer for a tool as a whole.
+//! A missing span is `NOT_A_SYMBOL`. An exclusive delete that would touch another contract is
+//! `BLOCKED`. Neither answer is a missing tool.
 
 mod apply;
 mod bulk_replace;
 mod change_signature;
+mod delete_closure;
 mod delete_readiness;
 mod edit_symbol;
 mod move_file;
@@ -93,6 +93,7 @@ impl RefactorSession {
                 apply::rollback_last_apply(state.root(), self.write_allowed)
             }
             Operation::ChangeSignature => change_signature::change_signature(state, arguments),
+            Operation::DeleteClosure => delete_closure::delete_closure(state, arguments),
         })
     }
 }
@@ -111,6 +112,7 @@ pub enum Operation {
     MoveFile,
     MoveSymbol,
     DeleteReadiness,
+    DeleteClosure,
 }
 
 impl Operation {
@@ -129,6 +131,7 @@ impl Operation {
             "move_file" => Some(Self::MoveFile),
             "move_symbol" => Some(Self::MoveSymbol),
             "delete_readiness" => Some(Self::DeleteReadiness),
+            "delete_closure" => Some(Self::DeleteClosure),
             _ => None,
         }
     }
@@ -163,6 +166,7 @@ impl Operation {
             Self::MoveFile => "move_file",
             Self::MoveSymbol => "move_symbol",
             Self::DeleteReadiness => "delete_readiness",
+            Self::DeleteClosure => "delete_closure",
         }
     }
 }
