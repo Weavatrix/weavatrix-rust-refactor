@@ -78,8 +78,17 @@ fn the_first_stage_lists_occurrences_and_plans_nothing() {
     assert!(answer.get("plan").is_none(), "stage one must not plan");
     assert_eq!(
         answer.get("total").and_then(Value::as_u64),
+        Some(1),
+        "the string literal is trivia and stays out of the default scan"
+    );
+    let with_trivia = call(
+        &root,
+        &json!({"pattern": "resolve", "replacement": "locate", "include_trivia": true}),
+    );
+    assert_eq!(
+        with_trivia.get("total").and_then(Value::as_u64),
         Some(2),
-        "the declaration and the string literal both match"
+        "include_trivia restores the string literal"
     );
 }
 
@@ -88,7 +97,7 @@ fn a_selection_plans_only_the_chosen_occurrence() {
     let root = repository("select", &[("src/lib.rs", CODE)]);
     let preview = call(
         &root,
-        &json!({"pattern": "resolve", "replacement": "locate"}),
+        &json!({"pattern": "resolve", "replacement": "locate", "include_trivia": true}),
     );
     let ids = occurrences(&preview);
     assert_eq!(ids.len(), 2);
@@ -97,6 +106,7 @@ fn a_selection_plans_only_the_chosen_occurrence() {
         &json!({
             "pattern": "resolve",
             "replacement": "locate",
+            "include_trivia": true,
             "occurrence_ids": [ids[0].0.clone()],
         }),
     );
@@ -109,13 +119,13 @@ fn planning_everything_requires_the_count_to_match() {
     let root = repository("count", &[("src/lib.rs", CODE)]);
     let wrong = call(
         &root,
-        &json!({"pattern": "resolve", "replacement": "locate", "expected_count": 99}),
+        &json!({"pattern": "resolve", "replacement": "locate", "include_trivia": true, "expected_count": 99}),
     );
     assert_eq!(status(&wrong), "COUNT_MISMATCH");
 
     let right = call(
         &root,
-        &json!({"pattern": "resolve", "replacement": "locate", "expected_count": 2}),
+        &json!({"pattern": "resolve", "replacement": "locate", "include_trivia": true, "expected_count": 2}),
     );
     assert_eq!(status(&right), "PLANNED");
     assert_eq!(right.get("total").and_then(Value::as_u64), Some(2));
@@ -270,7 +280,7 @@ fn a_plan_from_bulk_replace_survives_the_applier_and_writes_the_selection() {
         .call(
             &state,
             "bulk_replace",
-            &json!({"pattern": "resolve", "replacement": "locate", "expected_count": 2}),
+            &json!({"pattern": "resolve", "replacement": "locate", "include_trivia": true, "expected_count": 2}),
         )
         .expect("declared tool");
     assert_eq!(status(&preview), "PLANNED");
@@ -296,5 +306,34 @@ fn a_plan_from_bulk_replace_survives_the_applier_and_writes_the_selection() {
     assert_eq!(
         fs::read_to_string(root.join("src/lib.rs")).unwrap(),
         "pub fn locate() -> &'static str {\n    \"locate\"\n}\n"
+    );
+}
+
+#[test]
+fn a_comment_is_skipped_and_a_rust_attribute_is_code() {
+    let root = repository(
+        "comment",
+        &[(
+            "src/lib.rs",
+            "#[resolve]\npub fn resolve() {}\n// resolve in a comment\n",
+        )],
+    );
+    let answer = call(
+        &root,
+        &json!({"pattern": "resolve", "replacement": "locate"}),
+    );
+    assert_eq!(
+        answer.get("total").and_then(Value::as_u64),
+        Some(2),
+        "{answer:?}"
+    );
+    let with_trivia = call(
+        &root,
+        &json!({"pattern": "resolve", "replacement": "locate", "include_trivia": true}),
+    );
+    assert_eq!(
+        with_trivia.get("total").and_then(Value::as_u64),
+        Some(3),
+        "{with_trivia:?}"
     );
 }

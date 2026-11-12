@@ -10,10 +10,10 @@
 //! rather than by name — the classic case is `React` under JSX — so counting its occurrences
 //! proves nothing. They are reported instead.
 //!
-//! Other languages get the same analysis and no edits. In Rust `use std::io::Write` is used by
-//! calling `write_all`, never by naming `Write`; in Python an import in `__init__.py` is often
-//! the public API. Both would pass an occurrence count and both would break on removal, so the
-//! answer there is the candidate list and `UNPROVEN`, not a plan.
+//! Rust, Python and Go use the same count, with the cases an occurrence cannot prove left in
+//! place: a CamelCase Rust import (it may be a trait used through its methods), a `pub use`,
+//! a bare Python `import`, and a Go blank or dot import. A language with no recognised import
+//! syntax answers `NO_UNUSED_IMPORTS`.
 
 use crate::coordinates::utf16_offset;
 use crate::evidence::read_source;
@@ -33,6 +33,16 @@ struct Binding {
     end: usize,
 }
 
+/// A binding this operation will report and will not delete.
+struct Unnamed {
+    binding: String,
+    reason: &'static str,
+}
+
+/// Why a JavaScript default or namespace import is reported rather than removed.
+const JS_UNNAMED: &str = "a default or namespace import can be used by a transform rather than \
+     by name, so its occurrences prove nothing";
+
 /// One `import` statement, located but not yet judged.
 struct Import {
     /// The whole statement, `import` through the terminating `;`.
@@ -41,8 +51,8 @@ struct Import {
     named: Vec<Binding>,
     /// Byte range of the `{ ... }` group, when the statement has one.
     braces: Option<(usize, usize)>,
-    /// Default and namespace bindings, which are reported and never removed.
-    unnamed: Vec<String>,
+    /// Bindings that are reported and never removed.
+    unnamed: Vec<Unnamed>,
 }
 
 /// Tokens that carry program meaning, so an identifier in a comment is not a use.
@@ -156,10 +166,16 @@ fn imports(source: &str, tokens: &[Token]) -> Vec<Import> {
                 break;
             }
             if token.kind == TokenKind::Identifier && text != "type" && text != "as" {
-                statement.unnamed.push(text.to_owned());
+                statement.unnamed.push(Unnamed {
+                    binding: text.to_owned(),
+                    reason: JS_UNNAMED,
+                });
             }
             if text == "*" {
-                statement.unnamed.push("*".to_owned());
+                statement.unnamed.push(Unnamed {
+                    binding: "*".to_owned(),
+                    reason: JS_UNNAMED,
+                });
             }
             at += 1;
         }
@@ -345,21 +361,25 @@ pub(super) fn organize_imports(state: &RepositoryState, arguments: &Value) -> Va
         .and_then(|(_, ext)| Language::from_extension(ext))
     else {
         return json!({
-            "status": "UNPROVEN",
-            "reason": format!("{path} has no recognised language, so its imports were not read"),
+            "status": "NO_UNUSED_IMPORTS",
+            "file": path,
+            "reason": "the file has no recognised language, so no import syntax was read",
         });
     };
 
     let tokens = tokenize(&source, language);
-    let statements = imports(&source, &tokens);
+    let Some(statements) = statements_of(language, &source, &tokens) else {
+        return json!({
+            "status": "NO_UNUSED_IMPORTS",
+            "file": path,
+            "reason": format!("{language:?} has no import syntax this operation removes"),
+        });
+    };
     let candidates: Vec<&Binding> = statements
         .iter()
         .flat_map(|statement| statement.named.iter())
         .collect();
 
-    if !matches!(language, Language::JavaScript | Language::TypeScript) {
-        return unproven(path, language, &candidates);
-    }
     if statements.is_empty() {
         return json!({
             "status": "NO_UNUSED_IMPORTS",
@@ -373,18 +393,24 @@ pub(super) fn organize_imports(state: &RepositoryState, arguments: &Value) -> Va
     let mut removed = Vec::new();
     let reported = statements
         .iter()
-        .flat_map(|statement| statement.unnamed.iter().cloned())
-        .map(|name| {
+        .flat_map(|statement| statement.unnamed.iter())
+        .map(|entry| {
             json!({
-                "binding": name,
+                "binding": entry.binding,
                 "kind": "UNCERTAIN",
-                "reason": "a default or namespace import can be used by a transform rather than \
-                           by name, so its occurrences prove nothing",
+                "reason": entry.reason,
             })
         })
         .collect::<Vec<_>>();
 
+    let counted = matches!(language, Language::Rust | Language::Python | Language::Go);
     for statement in &statements {
+        // A statement that mixes a provable name with one this count cannot prove is left whole.
+        // Removing the provable name from beside an uncertain one is how a trait or a side-effect
+        // import gets deleted with its neighbour.
+        if counted && !statement.unnamed.is_empty() {
+            continue;
+        }
         builder = plan_statement(builder, &source, statement, &used, &mut removed);
     }
 
@@ -410,16 +436,408 @@ pub(super) fn organize_imports(state: &RepositoryState, arguments: &Value) -> Va
     })
 }
 
-/// The answer for a language where an unnamed occurrence count does not prove disuse.
-fn unproven(path: &str, language: Language, candidates: &[&Binding]) -> Value {
-    json!({
-        "status": "UNPROVEN",
-        "file": path,
-        "language": format!("{language:?}"),
-        "candidates": candidates.iter().map(|binding| binding.local.clone()).collect::<Vec<_>>(),
-        "reason": "outside JavaScript and TypeScript an import can be used without its name \
-                   appearing - a Rust trait through one of its methods, a Python re-export \
-                   through the module's public API - so an occurrence count cannot prove a \
-                   binding is unused and nothing was planned",
+/// The import statements of one language, or `None` when this operation does not read that syntax.
+fn statements_of(language: Language, source: &str, tokens: &[Token]) -> Option<Vec<Import>> {
+    Some(match language {
+        Language::JavaScript | Language::TypeScript => imports(source, tokens),
+        Language::Rust => rust_uses(source, tokens),
+        Language::Python => python_imports(source, tokens),
+        Language::Go => go_imports(source, tokens),
+        _ => return None,
     })
+}
+
+const RUST_TRAIT: &str = "a CamelCase Rust import can be a trait used through its methods, so its \
+     name not appearing does not prove it is unused";
+const RUST_PUB: &str = "a public re-export can be the module's API, so it was not removed";
+const RUST_GLOB: &str = "a glob import has no single name an occurrence count can prove";
+const RUST_SELF: &str = "a self, super or crate import names a module through its path, so it was \
+     left in place";
+const PY_BARE: &str = "a bare import names a module that may exist for its side effects, so it \
+     was not removed";
+const PY_GLOB: &str = "a star import has no single name an occurrence count can prove";
+const GO_SIDE: &str = "a blank or dot import is used for its side effects, so it was not removed";
+
+fn code_tokens(tokens: &[Token]) -> Vec<&Token> {
+    tokens.iter().filter(|token| is_code(token)).collect()
+}
+
+fn rust_uses(source: &str, tokens: &[Token]) -> Vec<Import> {
+    let code = code_tokens(tokens);
+    let mut found = Vec::new();
+    let mut at = 0_usize;
+    while at < code.len() {
+        if code[at].text(source) != "use" {
+            at += 1;
+            continue;
+        }
+        let public = rust_reexport(source, &code, at);
+        let mut statement = Import {
+            start: code[at].start,
+            end: code[at].end,
+            named: Vec::new(),
+            braces: None,
+            unnamed: Vec::new(),
+        };
+        at += 1;
+        rust_tree(source, &code, &mut at, &mut statement, public);
+        if code.get(at).is_some_and(|token| token.text(source) == ";") {
+            statement.end = code[at].end;
+            at += 1;
+        }
+        found.push(statement);
+    }
+    found
+}
+
+fn rust_reexport(source: &str, code: &[&Token], use_at: usize) -> bool {
+    let mut index = use_at;
+    while index > 0 {
+        index -= 1;
+        let text = code[index].text(source);
+        if text == ";" || text == "}" {
+            return false;
+        }
+        if text == "pub" {
+            return true;
+        }
+    }
+    false
+}
+
+fn rust_tree(source: &str, code: &[&Token], at: &mut usize, statement: &mut Import, public: bool) {
+    if *at >= code.len() {
+        return;
+    }
+    let text = code[*at].text(source);
+    if text == "{" {
+        *at += 1;
+        while *at < code.len() && code[*at].text(source) != "}" {
+            if code[*at].text(source) == "," {
+                *at += 1;
+                continue;
+            }
+            rust_tree(source, code, at, statement, public);
+        }
+        if *at < code.len() && code[*at].text(source) == "}" {
+            statement.end = code[*at].end;
+            *at += 1;
+        }
+        return;
+    }
+    if text == "*" {
+        push_unnamed(statement, "*", code[*at].end, RUST_GLOB);
+        *at += 1;
+        return;
+    }
+    let mut last: Option<&Token> = None;
+    while *at < code.len() {
+        let text = code[*at].text(source);
+        if text == ":" {
+            *at += 1;
+            continue;
+        }
+        if matches!(text, "{" | "}" | "," | ";" | "as" | "*") {
+            break;
+        }
+        if code[*at].kind == TokenKind::Identifier {
+            last = Some(code[*at]);
+        }
+        *at += 1;
+    }
+    if code
+        .get(*at)
+        .is_some_and(|token| token.text(source) == "as")
+    {
+        *at += 1;
+        if code
+            .get(*at)
+            .is_some_and(|token| token.kind == TokenKind::Identifier)
+        {
+            last = Some(code[*at]);
+            *at += 1;
+        }
+    }
+    if code.get(*at).is_some_and(|token| token.text(source) == "*") {
+        push_unnamed(statement, "*", code[*at].end, RUST_GLOB);
+        *at += 1;
+        return;
+    }
+    if code.get(*at).is_some_and(|token| token.text(source) == "{") {
+        rust_tree(source, code, at, statement, public);
+        return;
+    }
+    let Some(last) = last else {
+        return;
+    };
+    statement.end = last.end;
+    let name = last.text(source);
+    if public {
+        push_unnamed(statement, name, last.end, RUST_PUB);
+    } else if matches!(name, "self" | "super" | "crate") {
+        push_unnamed(statement, name, last.end, RUST_SELF);
+    } else if name.chars().next().is_some_and(char::is_uppercase) {
+        push_unnamed(statement, name, last.end, RUST_TRAIT);
+    } else {
+        statement.named.push(Binding {
+            local: name.to_owned(),
+            start: last.start,
+            end: last.end,
+        });
+    }
+}
+
+fn push_unnamed(statement: &mut Import, name: &str, end: usize, reason: &'static str) {
+    statement.end = end;
+    statement.unnamed.push(Unnamed {
+        binding: name.to_owned(),
+        reason,
+    });
+}
+
+fn python_imports(source: &str, tokens: &[Token]) -> Vec<Import> {
+    let code = code_tokens(tokens);
+    let mut found = Vec::new();
+    let mut at = 0_usize;
+    while at < code.len() {
+        let text = code[at].text(source);
+        if text == "from" {
+            found.push(python_from(source, &code, &mut at));
+        } else if text == "import" {
+            found.push(python_import(source, &code, &mut at));
+        } else {
+            at += 1;
+        }
+    }
+    found
+}
+
+fn python_stops(text: &str) -> bool {
+    matches!(
+        text,
+        "from"
+            | "import"
+            | "def"
+            | "class"
+            | "async"
+            | "if"
+            | "for"
+            | "while"
+            | "try"
+            | "with"
+            | "return"
+            | "raise"
+            | "yield"
+            | "assert"
+            | "pass"
+            | "del"
+            | "@"
+    )
+}
+
+fn python_from(source: &str, code: &[&Token], at: &mut usize) -> Import {
+    let mut statement = Import {
+        start: code[*at].start,
+        end: code[*at].end,
+        named: Vec::new(),
+        braces: None,
+        unnamed: Vec::new(),
+    };
+    *at += 1;
+    while *at < code.len()
+        && code[*at].text(source) != "import"
+        && !python_stops(code[*at].text(source))
+    {
+        *at += 1;
+    }
+    if code
+        .get(*at)
+        .is_some_and(|token| token.text(source) == "import")
+    {
+        *at += 1;
+    }
+    if code.get(*at).is_some_and(|token| token.text(source) == "(") {
+        *at += 1;
+    }
+    while *at < code.len() {
+        let token = code[*at];
+        let text = token.text(source);
+        if text == ")" || text == ";" {
+            statement.end = token.end;
+            *at += 1;
+            break;
+        }
+        if text == "," {
+            *at += 1;
+            continue;
+        }
+        if python_stops(text) {
+            break;
+        }
+        if text == "*" {
+            push_unnamed(&mut statement, "*", token.end, PY_GLOB);
+            *at += 1;
+            continue;
+        }
+        if token.kind != TokenKind::Identifier {
+            break;
+        }
+        let mut local = token;
+        *at += 1;
+        if code.get(*at).is_some_and(|next| next.text(source) == "as") {
+            *at += 1;
+            if let Some(alias) = code.get(*at).copied() {
+                local = alias;
+                *at += 1;
+            }
+        }
+        statement.end = local.end;
+        statement.named.push(Binding {
+            local: local.text(source).to_owned(),
+            start: local.start,
+            end: local.end,
+        });
+    }
+    statement
+}
+
+fn python_import(source: &str, code: &[&Token], at: &mut usize) -> Import {
+    let mut statement = Import {
+        start: code[*at].start,
+        end: code[*at].end,
+        named: Vec::new(),
+        braces: None,
+        unnamed: Vec::new(),
+    };
+    *at += 1;
+    while *at < code.len() {
+        let token = code[*at];
+        let text = token.text(source);
+        if text == "," || text == "." {
+            *at += 1;
+            continue;
+        }
+        if python_stops(text) || token.kind != TokenKind::Identifier {
+            break;
+        }
+        *at += 1;
+        if code.get(*at).is_some_and(|next| next.text(source) == "as") {
+            *at += 1;
+            if let Some(alias) = code.get(*at).copied() {
+                statement.end = alias.end;
+                statement.named.push(Binding {
+                    local: alias.text(source).to_owned(),
+                    start: alias.start,
+                    end: alias.end,
+                });
+                *at += 1;
+            }
+            continue;
+        }
+        push_unnamed(&mut statement, text, token.end, PY_BARE);
+        while code.get(*at).is_some_and(|next| next.text(source) == ".") {
+            *at += 1;
+            if code
+                .get(*at)
+                .is_some_and(|next| next.kind == TokenKind::Identifier)
+            {
+                statement.end = code[*at].end;
+                *at += 1;
+            }
+        }
+    }
+    statement
+}
+
+fn go_imports(source: &str, tokens: &[Token]) -> Vec<Import> {
+    let code = code_tokens(tokens);
+    let mut found = Vec::new();
+    let mut at = 0_usize;
+    while at < code.len() {
+        if code[at].text(source) != "import" {
+            at += 1;
+            continue;
+        }
+        let mut statement = Import {
+            start: code[at].start,
+            end: code[at].end,
+            named: Vec::new(),
+            braces: None,
+            unnamed: Vec::new(),
+        };
+        at += 1;
+        if code.get(at).is_some_and(|token| token.text(source) == "(") {
+            at += 1;
+            while at < code.len() && code[at].text(source) != ")" {
+                if !go_spec(source, &code, &mut at, &mut statement) {
+                    at += 1;
+                }
+            }
+            if at < code.len() && code[at].text(source) == ")" {
+                statement.end = code[at].end;
+                at += 1;
+            }
+        } else if !go_spec(source, &code, &mut at, &mut statement) {
+            at += 1;
+        }
+        found.push(statement);
+    }
+    found
+}
+
+fn go_spec(source: &str, code: &[&Token], at: &mut usize, statement: &mut Import) -> bool {
+    let Some(first) = code.get(*at).copied() else {
+        return false;
+    };
+    let text = first.text(source);
+    if text == "import" || text == ")" || text == ";" {
+        return false;
+    }
+    let mut alias: Option<&Token> = None;
+    let mut side: Option<&str> = None;
+    if text == "." {
+        side = Some(".");
+        *at += 1;
+    } else if first.kind == TokenKind::Identifier {
+        if text == "_" {
+            side = Some("_");
+        } else {
+            alias = Some(first);
+        }
+        *at += 1;
+    }
+    let Some(path) = code
+        .get(*at)
+        .copied()
+        .filter(|token| token.kind == TokenKind::String)
+    else {
+        return false;
+    };
+    *at += 1;
+    statement.end = path.end;
+    if let Some(name) = side {
+        push_unnamed(statement, name, path.end, GO_SIDE);
+    } else if let Some(alias) = alias {
+        statement.named.push(Binding {
+            local: alias.text(source).to_owned(),
+            start: alias.start,
+            end: alias.end,
+        });
+    } else if let Some(segment) = go_segment(path.text(source)) {
+        statement.named.push(Binding {
+            local: segment,
+            start: path.start,
+            end: path.end,
+        });
+    }
+    true
+}
+
+fn go_segment(literal: &str) -> Option<String> {
+    let inner = literal.trim_matches(|character| matches!(character, '"' | '`' | '\''));
+    inner
+        .rsplit('/')
+        .next()
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
 }

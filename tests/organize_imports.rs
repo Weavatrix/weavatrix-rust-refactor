@@ -307,7 +307,7 @@ fn a_dynamic_import_expression_is_not_treated_as_a_statement() {
 }
 
 #[test]
-fn a_rust_file_is_reported_unproven_rather_than_edited() {
+fn a_rust_trait_import_stays_and_is_not_a_plan() {
     let root = repository(
         "rust",
         &[(
@@ -316,11 +316,91 @@ fn a_rust_file_is_reported_unproven_rather_than_edited() {
         )],
     );
     let answer = organize(&root, "src/main.rs");
-    assert_eq!(
-        status(&answer),
-        "UNPROVEN",
-        "removing a trait import that is used through its methods would break the build: \
-         {answer:?}"
-    );
+    assert_eq!(status(&answer), "NO_UNUSED_IMPORTS", "{answer:?}");
     assert!(answer.get("plan").is_none(), "{answer:?}");
+    let uncertain = answer
+        .get("uncertain")
+        .and_then(Value::as_array)
+        .expect("uncertain");
+    assert!(
+        uncertain
+            .iter()
+            .any(|entry| entry.get("binding").and_then(Value::as_str) == Some("Write")),
+        "{answer:?}"
+    );
+}
+
+#[test]
+fn an_unused_rust_snake_case_import_is_removed() {
+    let root = repository(
+        "rust-snake",
+        &[(
+            "src/main.rs",
+            "use crate::util::helper;\nuse std::io::Write;\n\nfn main() {}\n",
+        )],
+    );
+    let after = apply(&root, "src/main.rs");
+    assert!(
+        !after.contains("helper"),
+        "the unused snake_case import should be gone, got {after:?}"
+    );
+    assert!(
+        after.contains("use std::io::Write;"),
+        "the trait import has to stay, got {after:?}"
+    );
+}
+
+#[test]
+fn a_public_rust_reexport_is_not_removed() {
+    let root = repository(
+        "rust-pub",
+        &[(
+            "src/lib.rs",
+            "pub use crate::util::helper;\nfn unused() {}\n",
+        )],
+    );
+    let answer = organize(&root, "src/lib.rs");
+    assert_eq!(status(&answer), "NO_UNUSED_IMPORTS", "{answer:?}");
+    assert!(answer.get("plan").is_none(), "{answer:?}");
+}
+
+#[test]
+fn an_unused_python_from_import_is_removed_and_a_bare_import_stays() {
+    let root = repository(
+        "python",
+        &[(
+            "src/app.py",
+            "from x import A\nimport os\nimport sys as path\n\ndef run():\n    return os\n",
+        )],
+    );
+    let after = apply(&root, "src/app.py");
+    assert!(
+        !after.contains("import A") && !after.contains("from x"),
+        "{after:?}"
+    );
+    assert!(after.contains("import os"), "{after:?}");
+    assert!(!after.contains("path"), "{after:?}");
+}
+
+#[test]
+fn a_bare_python_import_is_uncertain() {
+    let root = repository("py-bare", &[("src/app.py", "import os\n")]);
+    let answer = organize(&root, "src/app.py");
+    assert_eq!(status(&answer), "NO_UNUSED_IMPORTS", "{answer:?}");
+    assert!(answer.get("plan").is_none(), "{answer:?}");
+}
+
+#[test]
+fn an_unused_go_import_is_removed_and_a_blank_import_stays() {
+    let root = repository(
+        "go",
+        &[(
+            "main.go",
+            "package main\nimport \"fmt\"\nimport _ \"embed\"\nimport \"os\"\nfunc main() { fmt.Println(1) }\n",
+        )],
+    );
+    let after = apply(&root, "main.go");
+    assert!(after.contains("\"fmt\""), "{after:?}");
+    assert!(after.contains("_ \"embed\""), "{after:?}");
+    assert!(!after.contains("\"os\""), "{after:?}");
 }

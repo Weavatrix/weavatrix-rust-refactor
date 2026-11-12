@@ -1,10 +1,9 @@
 //! Occurrence-selective replacement over the indexed files.
 //!
-//! Two stages on purpose. The first returns every occurrence with a stable id and changes
-//! nothing; the second takes the ids the caller chose, or an exact count of everything, and only
-//! then produces a plan. A one-shot replace-all is the operation that quietly edits a string
-//! literal in a file nobody looked at — the benchmark caught exactly that, where three of six
-//! textual hits belonged to a different symbol.
+//! Two stages on purpose. The first returns every code occurrence with a stable id and changes
+//! nothing. Comments and strings are included only when `include_trivia` is set, so a replace
+//! does not quietly edit a literal or a comment. The second stage takes the ids the caller chose,
+//! or an exact count of everything, and only then produces a plan.
 
 use crate::coordinates::utf16_offset;
 use crate::evidence::read_source;
@@ -12,6 +11,7 @@ use crate::plan::{PlanBuilder, sha256_of};
 use blazingly_json::{Value, json};
 use regex::{Regex, RegexBuilder};
 use std::collections::BTreeSet;
+use weavatrix_parse::{Language, TokenKind, tokenize};
 use weavatrix_rust::{NodeKind, RepositoryState};
 
 /// Bounds, so a careless pattern cannot turn one call into a repository-sized answer.
@@ -92,6 +92,7 @@ fn scan(
     regex: &Regex,
     replacement: &str,
     prefix: Option<&str>,
+    include_trivia: bool,
 ) -> Result<(Vec<Occurrence>, usize, bool), Value> {
     let mut found = Vec::new();
     let mut scanned = 0_usize;
@@ -102,14 +103,23 @@ fn scan(
             continue;
         };
         scanned += 1;
+        let trivia = if include_trivia {
+            Vec::new()
+        } else {
+            trivia_ranges(&source, &file)
+        };
+        let mut line_start = 0_usize;
         let mut in_file = 0_usize;
-        for (number, text) in source.split('\n').enumerate() {
+        for (number, raw) in source.split('\n').enumerate() {
             let line = u32::try_from(number + 1).unwrap_or(u32::MAX);
-            let text = text.strip_suffix('\r').unwrap_or(text);
+            let text = raw.strip_suffix('\r').unwrap_or(raw);
             for capture in regex.captures_iter(text) {
                 let Some(whole) = capture.get(0) else {
                     continue;
                 };
+                if !include_trivia && in_trivia(&trivia, line_start + whole.start()) {
+                    continue;
+                }
                 if whole.is_empty() {
                     zero_width += 1;
                     continue;
@@ -142,6 +152,7 @@ fn scan(
             if capped {
                 break;
             }
+            line_start += raw.len() + 1;
         }
     }
     if found.is_empty() && zero_width > 0 {
@@ -154,6 +165,46 @@ fn scan(
         }));
     }
     Ok((found, scanned, capped))
+}
+
+/// Comments and string literals. A match that starts inside one is not code.
+///
+/// The tokenizer already knows that Rust `#` is an attribute, that `'static` is a lifetime, and
+/// that Python `#` is a comment. An extension it does not recognise keeps every match.
+fn trivia_ranges(source: &str, path: &str) -> Vec<(usize, usize)> {
+    let Some(language) = path
+        .rsplit_once('.')
+        .and_then(|(_, extension)| Language::from_extension(extension))
+    else {
+        return Vec::new();
+    };
+    tokenize(source, language)
+        .into_iter()
+        .filter(|token| {
+            matches!(
+                token.kind,
+                TokenKind::LineComment
+                    | TokenKind::BlockComment
+                    | TokenKind::String
+                    | TokenKind::Unterminated
+            )
+        })
+        .map(|token| (token.start, token.end))
+        .collect()
+}
+
+fn in_trivia(ranges: &[(usize, usize)], offset: usize) -> bool {
+    ranges
+        .binary_search_by(|range| {
+            if offset < range.0 {
+                std::cmp::Ordering::Greater
+            } else if offset >= range.1 {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 /// A short window around a match, for a caller choosing between occurrences.
@@ -196,11 +247,16 @@ pub(super) fn bulk_replace(state: &RepositoryState, arguments: &Value) -> Value 
         replacement.to_owned()
     };
     let prefix = arguments.get("path_prefix").and_then(Value::as_str);
+    let include_trivia = arguments
+        .get("include_trivia")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
-    let (occurrences, scanned, capped) = match scan(state, &regex, &expansion, prefix) {
-        Ok(found) => found,
-        Err(refusal) => return refusal,
-    };
+    let (occurrences, scanned, capped) =
+        match scan(state, &regex, &expansion, prefix, include_trivia) {
+            Ok(found) => found,
+            Err(refusal) => return refusal,
+        };
     if occurrences.is_empty() {
         return json!({
             "status": "NO_MATCHES",

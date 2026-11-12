@@ -336,3 +336,33 @@ fn a_consumed_token_cannot_apply_the_batch_twice() {
         "a single-use token must not apply twice: {second:?}"
     );
 }
+
+#[test]
+fn a_rust_preview_puts_the_new_name_in_the_plan() {
+    let root = repository("rust-plan");
+    let engine = Weavatrix::open(&root).expect("opens");
+    let Some(alpha) = declared(engine.state(), "alpha") else {
+        panic!("alpha is missing from the graph");
+    };
+    let answer = RefactorSession::read_only()
+        .call(
+            engine.state(),
+            "rename_related_symbols",
+            &json!({"renames": [{"symbol": alpha, "new_name": "first"}]}),
+        )
+        .expect("declared tool");
+    assert_eq!(status(&answer), "PREVIEW_OK", "{answer:?}");
+    assert!(answer.get("confirmToken").and_then(Value::as_str).is_some());
+    let renames = answer
+        .get("renames")
+        .and_then(Value::as_array)
+        .expect("renames");
+    assert!(
+        renames
+            .iter()
+            .any(|entry| entry.get("to").and_then(Value::as_str) == Some("first")),
+        "{answer:?}"
+    );
+    let plan = format!("{:?}", answer.get("plan"));
+    assert!(plan.contains("first"), "{plan}");
+}

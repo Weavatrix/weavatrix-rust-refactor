@@ -632,6 +632,72 @@ export function only() {\n\
     assert!(balanced(&source), "{source}");
 }
 
+#[test]
+fn a_unique_handler_in_another_file_is_deleted_with_the_route() {
+    let root = repository_with(
+        "cross-handler",
+        "\
+import { only } from \"./only.js\";\n\
+const app = { get(path, handler) { return handler; } };\n\
+app.get(\"/only\", only);\n\
+export function other() { return 1; }\n\
+",
+    );
+    fs::write(
+        root.join("src/only.js"),
+        "export function only() {\n  return 1;\n}\n",
+    )
+    .expect("handler");
+    let engine = open(&root);
+    let state = engine.state().clone();
+    let Some(id) = endpoint(&state, "/only") else {
+        panic!("the route is missing from the graph");
+    };
+    let session = RefactorSession::new(true);
+    let planned = session
+        .call(
+            &state,
+            "delete_closure",
+            &json!({"symbol": id, "scope": "exclusive"}),
+        )
+        .expect("declared tool");
+    assert_eq!(status_of(&planned), "PLANNED", "{planned:?}");
+    let deleted = labels(&planned, "deleted");
+    assert!(
+        deleted.iter().any(|label| label == "only"),
+        "the handler in the other file has to be in the closure: {planned:?}"
+    );
+    let plan = planned.get("plan").expect("plan").clone();
+    let preview = session
+        .call(&state, "apply_edit_plan", &json!({"plan": plan.clone()}))
+        .expect("preview");
+    assert_eq!(status_of(&preview), "PREVIEW_OK", "{preview:?}");
+    let token = preview
+        .get("confirmToken")
+        .and_then(Value::as_str)
+        .expect("token")
+        .to_owned();
+    let applied = session
+        .call(
+            &state,
+            "apply_edit_plan",
+            &json!({"plan": plan, "mode": "apply", "confirm_token": token}),
+        )
+        .expect("apply");
+    assert_eq!(status_of(&applied), "APPLIED", "{applied:?}");
+    let service = fs::read_to_string(root.join("src/service.js")).expect("service");
+    let handler = fs::read_to_string(root.join("src/only.js")).expect("handler");
+    assert!(
+        !service.contains("\"/only\""),
+        "the route literal should be gone, got {service}"
+    );
+    assert!(service.contains("function other("), "{service}");
+    assert!(
+        !handler.contains("function only("),
+        "the handler in the other file should be gone, got {handler}"
+    );
+}
+
 fn file_node(state: &RepositoryState, path: &str) -> Option<String> {
     state
         .graph()

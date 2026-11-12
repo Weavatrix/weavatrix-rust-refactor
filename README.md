@@ -58,9 +58,9 @@ contract fails to compile rather than answering "not supported" at run time.
 | `rename_symbol` | graph + lexical | The declaration, every site the graph proves calls or references it, and the import lines of files the graph proves import the declaring file |
 | `rename_related_symbols` | the same, merged | One transaction for several renames, with collision and contested-site detection; chains and swaps apply simultaneously rather than in sequence |
 | `change_signature` | graph + token-split lists | A parameter added or removed in any indexed language. A typed language copies the previous parameter's type. With a default, existing calls stay; without one they are listed unless a call-site value is given |
-| `organize_imports` | occurrence count | Named JS/TS bindings whose identifier occurs once in the file |
+| `organize_imports` | occurrence count | Named bindings whose identifier occurs once. Rust snake_case, Python from-imports and aliases, and Go path segments are counted; traits, `pub use`, bare Python imports, and Go blank or dot imports stay |
 | `edit_symbol` | declaration range | A symbol-anchored replacement or insertion. The end is the matching brace, the indent block, or the signature line. The plan warns that syntax was not checked |
-| `bulk_replace` | lexical | Literal or regex matches in indexed file text, including comments and strings |
+| `bulk_replace` | lexical | Literal or regex matches in indexed code. Comments and strings are included only with `include_trivia` |
 | `move_file` | specifier arithmetic | The filesystem rename and the relative import specifiers, in one transaction. A missing parent directory is created at apply and left in place on rollback |
 | `move_symbol` | graph | A cycle review plus an edit plan that cuts the declaration into the destination file |
 | `delete_readiness` | graph | Whether anything still depends on the symbol. A private symbol with no incoming use can be `safe: true`. The verdict stays `REVIEW_REQUIRED` and nothing is written |
@@ -91,10 +91,13 @@ span, is `NOT_A_SYMBOL`. A handler named on the following line of an unclosed
 A closer line may end with a `//` or `/* */` comment. A route label is renamed
 as a path literal. A missing span on a rename is `NOT_A_SYMBOL`.
 
-Outside JavaScript and TypeScript, `organize_imports` reports candidates and
-answers `UNPROVEN` instead of planning. `use std::io::Write` is used by calling
-`write_all` and never by naming `Write`, and a Python import in `__init__.py` is
-often the public API; both pass an occurrence count and both break on removal.
+`organize_imports` counts a name and removes it only when that count proves the
+import is unused. `use std::io::Write` stays: a CamelCase Rust import can be a
+trait used through its methods. `pub use`, a bare Python `import`, and a Go
+blank or dot import stay for the same reason. A snake_case Rust `use`, a Python
+`from` import, and a Go path segment are removed when the name occurs only on
+the import itself. A language with no recognised import syntax answers
+`NO_UNUSED_IMPORTS`.
 
 ## Safety boundary
 

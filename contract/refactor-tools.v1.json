@@ -52,7 +52,7 @@
     },
     {
       "name": "rename_related_symbols",
-      "description": "Complete coordinated JS/TS multi-symbol rename as ONE atomic workflow with conflict/chain/swap detection. Default mode=\"preview\" returns a plan-bound confirm_token; repeat with identical renames, mode=\"apply\", and that token to write atomically with rollback. Blocks entirely if any sub-rename fails.",
+      "description": "Complete coordinated multi-symbol rename as ONE atomic workflow with conflict/chain/swap detection. Sites are the same ones rename_symbol proves, in every indexed language. Default mode=\"preview\" returns a plan-bound confirm_token; repeat with identical renames, mode=\"apply\", and that token to write atomically with rollback. Blocks entirely if any sub-rename fails.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -227,7 +227,7 @@
     },
     {
       "name": "bulk_replace",
-      "description": "Two-stage occurrence-selective pattern replace over the indexed universe. Preview (no selection) returns stable occurrence ids; then pass occurrence_ids or expected_count to plan. literal:true by default.",
+      "description": "Two-stage occurrence-selective pattern replace over the indexed universe. Preview (no selection) returns stable occurrence ids; then pass occurrence_ids or expected_count to plan. literal:true by default. Comments and strings are skipped unless include_trivia is true.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -256,6 +256,11 @@
           "expected_count": {
             "type": "integer"
           },
+          "include_trivia": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, comments and string literals are matches too. The default scans code only."
+          },
           "output_format": {
             "type": "string",
             "enum": [
@@ -274,7 +279,7 @@
     },
     {
       "name": "organize_imports",
-      "description": "Removes provably-unused named imports from a JS/TS file (a binding is removed only when its name occurs once in the file). Default/namespace imports are reported UNCERTAIN, never removed; sorting is left to the formatter.",
+      "description": "Removes provably-unused named imports. A binding is removed only when its name occurs once. JS/TS default and namespace imports stay uncertain. Rust snake_case use items are counted; CamelCase and pub use stay uncertain. Python from-imports and aliases are counted; a bare import stays uncertain. Go aliases and the last path segment are counted; blank and dot imports stay uncertain.",
       "inputSchema": {
         "type": "object",
         "properties": {
