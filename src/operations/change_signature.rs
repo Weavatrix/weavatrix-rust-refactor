@@ -1,10 +1,9 @@
 //! Adding and removing a parameter, with the call sites that pass it.
 //!
-//! This is always `PARTIAL`. The call sites come from graph edges, so a call the graph did not
-//! record is a call this does not touch — and unlike a rename, where a missed site merely keeps
-//! an old name, a missed site here keeps an argument the function no longer takes. Every call
-//! site the plan edits is listed, and everything the analysis could not settle is listed beside
-//! it rather than folded into the count.
+//! This is always `PARTIAL`. Proven graph calls are edited. A call the graph missed is edited
+//! only when the name is declared once and its argument list can be read; anything else is
+//! listed and left unchanged. Unlike a rename, where a missed site merely keeps an old name, a
+//! missed site here keeps an argument the function no longer takes.
 //!
 //! Two shapes are refused rather than guessed. A call that spreads (`f(...args)`) has no
 //! positional argument to remove, because the array decides at run time how many there are. And
@@ -20,7 +19,7 @@ use crate::resolve::resolve_symbol;
 use blazingly_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use weavatrix_parse::{Language, Token, TokenKind, tokenize};
-use weavatrix_rust::RepositoryState;
+use weavatrix_rust::{NodeKind, RepositoryState};
 
 /// What the caller asked for.
 enum Change {
@@ -55,9 +54,7 @@ struct Source {
 impl Source {
     fn open(root: &std::path::Path, path: &str) -> Option<Self> {
         let text = read_source(root, path)?;
-        let language = path
-            .rsplit_once('.')
-            .and_then(|(_, extension)| Language::from_extension(extension))?;
+        let language = language_of(path)?;
         let tokens = tokenize(&text, language);
         Some(Self { text, tokens })
     }
@@ -97,6 +94,119 @@ fn list_at(source: &Source, code: &[&Token], name: &str, line: u32) -> Option<Li
 /// a proven-body fallback for older evidence that only identifies the calling symbol.
 fn call_lines(state: &RepositoryState, id: &str) -> BTreeMap<String, BTreeSet<u32>> {
     super::rename_symbol::referencing_lines(state, id)
+}
+
+/// Kotlin is not a `Language` in weavatrix-parse 0.3.5. The Java tokenizer is lossless enough
+/// for identifiers and parentheses, which is all a signature edit reads.
+fn language_of(path: &str) -> Option<Language> {
+    let extension = path.rsplit_once('.')?.1;
+    if extension.eq_ignore_ascii_case("kt") || extension.eq_ignore_ascii_case("kts") {
+        return Some(Language::Java);
+    }
+    Language::from_extension(extension)
+}
+
+fn unique_name(state: &RepositoryState, name: &str) -> bool {
+    state
+        .graph()
+        .nodes()
+        .iter()
+        .filter(|node| node.label.trim_end_matches("()") == name)
+        .take(2)
+        .count()
+        == 1
+}
+
+fn indexed_paths(state: &RepositoryState) -> Vec<String> {
+    let mut files = state
+        .graph()
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == NodeKind::File)
+        .map(|node| node.label.clone())
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    files.sort_unstable();
+    files.dedup();
+    files
+}
+
+fn opens_call(source: &Source, code: &[&Token], mut at: usize) -> bool {
+    if code
+        .get(at)
+        .is_some_and(|token| token.text(&source.text) == "<")
+    {
+        let Some(end) = code[at..]
+            .iter()
+            .position(|token| token.text(&source.text) == ">")
+        else {
+            return false;
+        };
+        at += end + 1;
+    }
+    code.get(at)
+        .is_some_and(|token| token.text(&source.text) == "(")
+}
+
+/// Calls the graph did not record. A name declared more than once is never edited from this list.
+fn lexical_hits(target: &Target, uncertain: &mut Vec<Value>) -> Vec<(String, u32)> {
+    let unique = unique_name(target.state, target.name);
+    let known = call_lines(target.state, target.id);
+    let mut hits = Vec::new();
+    for path in indexed_paths(target.state) {
+        let Some(source) = Source::open(target.state.root(), &path) else {
+            continue;
+        };
+        let code = source.code();
+        let mut index = 0;
+        while index < code.len() {
+            let token = code[index];
+            index += 1;
+            if token.kind != TokenKind::Identifier || token.text(&source.text) != target.name {
+                continue;
+            }
+            if !opens_call(&source, &code, index) {
+                continue;
+            }
+            let line = token.line;
+            if path == target.file && line == target.line {
+                continue;
+            }
+            if known.get(&path).is_some_and(|lines| lines.contains(&line)) {
+                continue;
+            }
+            if !unique {
+                uncertain.push(json!({
+                    "file": path,
+                    "line": line,
+                    "kind": "CALL_AMBIGUOUS",
+                    "reason": "this name is declared more than once, so a call the graph did not \
+                               record was left unchanged",
+                }));
+                continue;
+            }
+            if list_at(&source, &code, target.name, line).is_none() {
+                uncertain.push(json!({
+                    "file": path,
+                    "line": line,
+                    "kind": "GRAPH_MISSED",
+                    "reason": "a call with this name is not a graph edge, and its argument list \
+                               could not be read",
+                }));
+                continue;
+            }
+            hits.push((path.clone(), line));
+        }
+    }
+    hits
+}
+
+fn call_sites_of(target: &Target, uncertain: &mut Vec<Value>) -> BTreeMap<String, BTreeSet<u32>> {
+    let mut lines = call_lines(target.state, target.id);
+    for (path, line) in lexical_hits(target, uncertain) {
+        lines.entry(path).or_default().insert(line);
+    }
+    lines
 }
 
 fn style_of(path: &str) -> Style {
@@ -264,6 +374,8 @@ struct Target<'a> {
     name: &'a str,
     source: &'a Source,
     parameters: &'a List,
+    file: &'a str,
+    line: u32,
 }
 
 /// What one change resolved to.
@@ -305,7 +417,7 @@ fn plan_add(
             uncertain,
         };
     }
-    let uncertain = call_lines(target.state, target.id)
+    let mut uncertain = call_lines(target.state, target.id)
         .into_iter()
         .flat_map(|(file, lines)| {
             lines
@@ -321,7 +433,16 @@ fn plan_add(
                 })
                 .collect::<Vec<_>>()
         })
-        .collect();
+        .collect::<Vec<_>>();
+    for (file, line) in lexical_hits(target, &mut uncertain) {
+        uncertain.push(json!({
+            "file": file,
+            "line": line,
+            "kind": "VALUE_REQUIRED",
+            "reason": "the parameter has no default, so this call needs an \
+                       argument that only you can choose",
+        }));
+    }
     Planned {
         builder,
         call_sites: Vec::new(),
@@ -336,7 +457,8 @@ fn append_calls(
 ) -> (PlanBuilder, Vec<Value>, Vec<Value>) {
     let mut edited = Vec::new();
     let mut uncertain = Vec::new();
-    for (path, lines) in call_lines(target.state, target.id) {
+    let sites = call_sites_of(target, &mut uncertain);
+    for (path, lines) in sites {
         let Some(source) = Source::open(target.state.root(), &path) else {
             uncertain.push(json!({"file": path, "kind": "SOURCE_UNAVAILABLE"}));
             continue;
@@ -345,6 +467,12 @@ fn append_calls(
         let mut opened = false;
         for line in lines {
             let Some(list) = list_at(&source, &code, target.name, line) else {
+                uncertain.push(json!({
+                    "file": path,
+                    "line": line,
+                    "kind": "CALL_UNPARSED",
+                    "reason": "the graph records a call here, but no argument list could be read",
+                }));
                 continue;
             };
             if list.items.iter().any(|item| item.spread) {
@@ -409,7 +537,8 @@ fn edit_call_sites(
     let state = target.state;
     let name = target.name;
     let mut edited = Vec::new();
-    for (path, lines) in call_lines(state, target.id) {
+    let sites = call_sites_of(target, uncertain);
+    for (path, lines) in sites {
         let Some(source) = Source::open(state.root(), &path) else {
             uncertain.push(json!({"file": path, "kind": "SOURCE_UNAVAILABLE"}));
             continue;
@@ -418,6 +547,12 @@ fn edit_call_sites(
         let mut opened = false;
         for line in lines {
             let Some(list) = list_at(&source, &code, name, line) else {
+                uncertain.push(json!({
+                    "file": path,
+                    "line": line,
+                    "kind": "CALL_UNPARSED",
+                    "reason": "the graph records a call here, but no argument list could be read",
+                }));
                 continue;
             };
             if list.items.iter().any(|item| item.spread) {
@@ -497,6 +632,8 @@ pub(super) fn change_signature(state: &RepositoryState, arguments: &Value) -> Va
         name: &name,
         source: &source,
         parameters: &parameters,
+        file: &path,
+        line: span.start.line,
     };
     let Planned {
         builder: plan,
@@ -567,6 +704,14 @@ pub(crate) fn parameters_of(
 mod tests {
     use super::parameters_of;
     use weavatrix_parse::Language;
+
+    #[test]
+    fn a_kotlin_file_is_read_with_the_java_tokenizer() {
+        let language = super::language_of("App.kt").expect("kotlin");
+        let items = parameters_of("fun run(one: Int) {}\n", language, "run", 1);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(items[0].text.contains("one"), "{items:?}");
+    }
 
     #[test]
     fn a_declaration_yields_its_parameters() {

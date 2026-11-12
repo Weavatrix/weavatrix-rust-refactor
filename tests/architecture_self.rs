@@ -79,10 +79,13 @@ fn the_catalog_has_exactly_one_source() {
     );
 }
 
+/// Source bytes go through weavatrix-worktree. `journal.rs` is the one exception: it writes the
+/// apply-order file and the cross-process lock under `.weavatrix`, and it removes an empty
+/// directory a rename created. Worktree 0.2.1 records neither.
 #[test]
 fn no_engine_writes_to_the_filesystem() {
     for (path, text) in rust_sources() {
-        if path.ends_with("test_support.rs") {
+        if path.ends_with("test_support.rs") || path.ends_with("journal.rs") {
             continue;
         }
         let production = production_only(&text);
@@ -95,6 +98,17 @@ fn no_engine_writes_to_the_filesystem() {
             );
         }
     }
+    let journal = rust_sources()
+        .into_iter()
+        .find(|(path, _)| path.ends_with("journal.rs"))
+        .expect("journal module");
+    let production = production_only(&journal.1);
+    assert!(
+        production.contains(".weavatrix")
+            && production.contains("refactor-journal.json")
+            && production.contains("refactor-write.lock"),
+        "journal.rs may write only the apply-order file and the write lock under .weavatrix"
+    );
 }
 
 #[test]

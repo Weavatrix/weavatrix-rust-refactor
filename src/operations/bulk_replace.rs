@@ -170,13 +170,14 @@ fn scan(
 /// Comments and string literals. A match that starts inside one is not code.
 ///
 /// The tokenizer already knows that Rust `#` is an attribute, that `'static` is a lifetime, and
-/// that Python `#` is a comment. An extension it does not recognise keeps every match.
+/// that Python `#` is a comment. An extension it does not recognise uses a generic scan: `//`,
+/// block comments, quotes, and a `#` that is the first non-whitespace on its line.
 fn trivia_ranges(source: &str, path: &str) -> Vec<(usize, usize)> {
     let Some(language) = path
         .rsplit_once('.')
         .and_then(|(_, extension)| Language::from_extension(extension))
     else {
-        return Vec::new();
+        return super::text_scan::trivia_spans(source, true);
     };
     tokenize(source, language)
         .into_iter()
@@ -377,4 +378,28 @@ fn plan(
         "warnings": ["INDEXED_FILES_ONLY"],
         "next": "apply with apply_edit_plan (preview -> confirm)",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{in_trivia, trivia_ranges};
+
+    #[test]
+    fn an_unknown_extension_skips_comments_strings_and_hash_lines() {
+        let source = "mark\n// mark\nconst s = \"mark\"\n# mark\nmid # mark\n";
+        let ranges = trivia_ranges(source, "notes.kt");
+        let code = source.find("mark").expect("code");
+        assert!(!in_trivia(&ranges, code), "{ranges:?}");
+        let comment = source.find("// mark").expect("comment");
+        assert!(in_trivia(&ranges, comment + 3), "{ranges:?}");
+        let string = source.find("\"mark\"").expect("string");
+        assert!(in_trivia(&ranges, string + 1), "{ranges:?}");
+        let hash = source.find("# mark").expect("hash");
+        assert!(in_trivia(&ranges, hash + 2), "{ranges:?}");
+        let mid = source.rfind("mark").expect("mid-line");
+        assert!(
+            !in_trivia(&ranges, mid),
+            "a hash that is not the first non-whitespace on the line stays code: {ranges:?}"
+        );
+    }
 }

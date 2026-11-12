@@ -152,12 +152,18 @@ pub(super) fn edit_symbol(state: &RepositoryState, arguments: &Value) -> Value {
         )
         .build();
 
+    let proven = declaration.end_proven;
+    let warnings = if proven {
+        vec!["SYNTAX_CHECK_NOT_PERFORMED"]
+    } else {
+        vec!["SYNTAX_CHECK_NOT_PERFORMED", "DECLARATION_END_UNPROVEN"]
+    };
     json!({
         "status": "PLANNED",
-        "completeness": "COMPLETE",
+        "completeness": if proven { "COMPLETE" } else { "PARTIAL" },
         "symbol": label,
         "plan": plan,
-        "warnings": ["SYNTAX_CHECK_NOT_PERFORMED"],
+        "warnings": warnings,
         "next": "apply with apply_edit_plan (preview -> confirm). The native engine does not \
                  syntax-check the result, so review it or run the project's own build.",
     })

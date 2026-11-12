@@ -149,6 +149,7 @@ fn organize_imports_edits_rust_python_and_go_and_names_an_unknown_language() {
                 "package main\nimport \"fmt\"\nimport _ \"embed\"\nimport \"os\"\nfunc main() { fmt.Println(1) }\n",
             ),
             ("App.kt", "import foo.Bar\n"),
+            ("notes.xyz", "import foo.Bar\n"),
         ],
     );
     let engine = open(&root);
@@ -186,8 +187,68 @@ fn organize_imports_edits_rust_python_and_go_and_names_an_unknown_language() {
     let kotlin = session
         .call(&state, "organize_imports", &json!({"file": "App.kt"}))
         .expect("tool");
-    expect_status(&kotlin, "NO_UNUSED_IMPORTS");
-    assert!(kotlin.get("plan").is_none(), "{kotlin:?}");
+    expect_status(&kotlin, "PLANNED");
+    apply(&session, &state, kotlin.get("plan").expect("plan"));
+    let kotlin_after = fs::read_to_string(root.join("App.kt")).expect("kotlin");
+    assert!(!kotlin_after.contains("import foo.Bar"), "{kotlin_after}");
+
+    let unknown = session
+        .call(&state, "organize_imports", &json!({"file": "notes.xyz"}))
+        .expect("tool");
+    expect_status(&unknown, "NO_UNUSED_IMPORTS");
+    assert!(unknown.get("plan").is_none(), "{unknown:?}");
+}
+
+#[test]
+fn organize_imports_removes_unused_java_csharp_and_cpp_names() {
+    let root = repository(
+        "managed",
+        &[
+            (
+                "App.java",
+                "import com.foo.Bar;\nimport com.foo.Used;\nclass T { Used value; }\n",
+            ),
+            (
+                "App.cs",
+                "using System.Text;\nusing Alias = System.IO;\nclass T { Text value; }\n",
+            ),
+            (
+                "App.cc",
+                "#include <vector>\nusing std::vector;\nusing namespace std;\nint main() { return 0; }\n",
+            ),
+        ],
+    );
+    let engine = open(&root);
+    let state = engine.state().clone();
+    let session = RefactorSession::new(true);
+
+    let java = session
+        .call(&state, "organize_imports", &json!({"file": "App.java"}))
+        .expect("tool");
+    expect_status(&java, "PLANNED");
+    apply(&session, &state, java.get("plan").expect("plan"));
+    let java_after = fs::read_to_string(root.join("App.java")).expect("java");
+    assert!(!java_after.contains("Bar"), "{java_after}");
+    assert!(java_after.contains("Used"), "{java_after}");
+
+    let csharp = session
+        .call(&state, "organize_imports", &json!({"file": "App.cs"}))
+        .expect("tool");
+    expect_status(&csharp, "PLANNED");
+    apply(&session, &state, csharp.get("plan").expect("plan"));
+    let csharp_after = fs::read_to_string(root.join("App.cs")).expect("csharp");
+    assert!(!csharp_after.contains("Alias"), "{csharp_after}");
+    assert!(csharp_after.contains("Text"), "{csharp_after}");
+
+    let cpp = session
+        .call(&state, "organize_imports", &json!({"file": "App.cc"}))
+        .expect("tool");
+    expect_status(&cpp, "PLANNED");
+    apply(&session, &state, cpp.get("plan").expect("plan"));
+    let cpp_after = fs::read_to_string(root.join("App.cc")).expect("cpp");
+    assert!(!cpp_after.contains("using std::vector"), "{cpp_after}");
+    assert!(cpp_after.contains("#include"), "{cpp_after}");
+    assert!(cpp_after.contains("using namespace std"), "{cpp_after}");
 }
 
 #[test]
@@ -327,6 +388,7 @@ fn delete_closure_removes_an_unused_file_and_a_cross_file_handler() {
     let service = fs::read_to_string(root.join("src/service.js")).expect("service");
     let handler = fs::read_to_string(root.join("src/only.js")).expect("handler");
     assert!(!service.contains("\"/only\""), "{service}");
+    assert!(!service.contains("only.js"), "{service}");
     assert!(service.contains("function other("), "{service}");
     assert!(!handler.contains("function only("), "{handler}");
 }

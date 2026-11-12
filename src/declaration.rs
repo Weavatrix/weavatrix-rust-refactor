@@ -18,10 +18,10 @@ pub struct DeclarationRange {
     pub start: usize,
     /// One past the last byte: the closing brace, or the terminating `;`.
     pub end: usize,
-    /// Whether the end was located in the source, or is only where the signature stopped.
+    /// Whether the end was matched to a body, or is only the signature line.
     ///
-    /// A caller must not offer "insert after this declaration" on an unproven end — it would
-    /// place the text in the middle of something.
+    /// `body_lines` does not widen past an unproven end. An edit may still be planned against
+    /// that line; the plan is then partial, because the signature line is not a proven body.
     pub end_proven: bool,
 }
 
@@ -89,12 +89,18 @@ fn range_at(source: &str, path: &str, start: usize) -> DeclarationRange {
     let language = path
         .rsplit_once('.')
         .and_then(|(_, extension)| Language::from_extension(extension));
-    let end =
-        proved_end(source, language, start).unwrap_or(start.max(declaration_floor(source, start)));
+    if let Some(end) = matched_end(source, language, start) {
+        return DeclarationRange {
+            start,
+            end,
+            end_proven: true,
+        };
+    }
+    let end = signature_line_end(source, start).unwrap_or_else(|| declaration_floor(source, start));
     DeclarationRange {
         start,
         end,
-        end_proven: true,
+        end_proven: false,
     }
 }
 
@@ -131,15 +137,14 @@ fn contains_word(line: &str, name: &str) -> bool {
     false
 }
 
-/// Brace match, then a raw scan, then an indentation block, then the signature line.
-fn proved_end(source: &str, language: Option<Language>, start: usize) -> Option<usize> {
+/// A body end that was actually matched. The signature line is not a match.
+fn matched_end(source: &str, language: Option<Language>, start: usize) -> Option<usize> {
     if language.is_some_and(|language| language.syntax().significant_indentation) {
-        return indent_block_end(source, start).or_else(|| signature_line_end(source, start));
+        return indent_block_end(source, start);
     }
     language
         .and_then(|language| declaration_end(source, language, start))
         .or_else(|| raw_brace_end(source, start))
-        .or_else(|| signature_line_end(source, start))
 }
 
 fn signature_line_end(source: &str, start: usize) -> Option<usize> {
@@ -363,7 +368,17 @@ mod tests {
         let source = "pub fn one() -> u32 {\n    1\n\npub fn two() {}\n";
         let range = locate(source, "src/lib.rs", "one", 1).expect("declaration");
         let text = &source[range.start..range.end];
+        assert!(!range.end_proven, "{text:?}");
         assert!(!text.contains("fn two"), "{text:?}");
+    }
+
+    #[test]
+    fn a_signature_without_a_body_is_not_a_proven_end() {
+        let source = "pub fn one()\n";
+        let range = locate(source, "src/lib.rs", "one", 1).expect("declaration");
+        let text = &source[range.start..range.end];
+        assert!(!range.end_proven, "{text:?}");
+        assert_eq!(text, "pub fn one()");
     }
 
     #[test]

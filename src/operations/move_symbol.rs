@@ -1,8 +1,8 @@
 //! What moving a declaration to another file would do, and the edit that does it.
 //!
 //! The cycle verdict is a projection from simulated edges, not a rebuild. The plan is the
-//! mechanical half: cut the declaration out of its file and insert it at the end of `to_file`.
-//! An import line in the destination that names only this symbol is removed with it.
+//! mechanical half: cut the declaration out of its file, insert it at the end of `to_file`,
+//! retarget imports that named it, and carry the imports the declaration itself uses.
 
 use crate::coordinates::utf16_offset;
 use crate::declaration::locate;
@@ -167,9 +167,13 @@ pub(super) fn move_symbol(state: &RepositoryState, arguments: &Value) -> Value {
     } else {
         "WOULD_VIOLATE"
     };
+    let name = node.label.trim_end_matches("()");
+    let relocation = relocation_plan(state, node, &from, to_file, name);
     let uncertain = importers
         .iter()
-        .filter(|file| file.as_str() != to_file)
+        .filter(|file| {
+            file.as_str() != to_file && !relocation.rewritten.iter().any(|done| done == *file)
+        })
         .map(|file| {
             json!({
                 "file": file,
@@ -192,12 +196,17 @@ pub(super) fn move_symbol(state: &RepositoryState, arguments: &Value) -> Value {
             "newDependencies": new_dependencies,
         },
         "fidelity": "PROJECTED_FROM_GRAPH_EDGES",
-        "plan": relocation_plan(state, node, &from, to_file),
+        "plan": relocation.plan,
         "uncertainReferences": uncertain,
         "next": "review the cycle verdict, then apply the plan with apply_edit_plan \
-                 (preview -> confirm). The plan cuts the declaration and inserts it into the \
-                 destination file.",
+                 (preview -> confirm). The plan moves the declaration and retargets the imports \
+                 it can prove.",
     })
+}
+
+struct Relocation {
+    plan: Option<Value>,
+    rewritten: Vec<String>,
 }
 
 /// Cuts the declaration and appends it to `to_file`.
@@ -206,10 +215,75 @@ fn relocation_plan(
     node: &weavatrix_rust::Node,
     from: &str,
     to_file: &str,
-) -> Option<Value> {
+    name: &str,
+) -> Relocation {
+    let Some(moved) = moved_text(state, node, from, name) else {
+        return Relocation {
+            plan: None,
+            rewritten: Vec::new(),
+        };
+    };
+    let destination = read_source(state.root(), to_file).unwrap_or_default();
+    let origin = super::move_imports::Origin {
+        source: &moved.source,
+        from,
+        to_file,
+        name,
+        declaration: &moved.declaration,
+        at: (moved.range_start, moved.range_end),
+        destination: &destination,
+    };
+    let repairs = super::move_imports::repairs(state, &origin);
+    let mut builder = PlanBuilder::new("move_symbol")
+        .file(from, &sha256_of(&moved.source))
+        .edit(
+            moved.start_line,
+            moved.start_char,
+            moved.end_line,
+            moved.end_char,
+            moved.before,
+            repairs.leftover.clone(),
+            "EXTRACTED",
+        );
+    if !destination.is_empty() || read_source(state.root(), to_file).is_some() {
+        builder = append_declaration(
+            builder,
+            to_file,
+            &destination,
+            name,
+            &moved.declaration,
+            &repairs.carried,
+        );
+    }
+    for edit in &repairs.edits {
+        builder = push_import(builder, state, edit);
+    }
+    Relocation {
+        plan: Some(builder.build()),
+        rewritten: repairs.rewritten,
+    }
+}
+
+struct MovedText {
+    source: String,
+    declaration: String,
+    before: String,
+    range_start: usize,
+    range_end: usize,
+    start_line: u32,
+    start_char: u32,
+    end_line: u32,
+    end_char: u32,
+}
+
+fn moved_text(
+    state: &RepositoryState,
+    node: &weavatrix_rust::Node,
+    from: &str,
+    name: &str,
+) -> Option<MovedText> {
     let source = read_source(state.root(), from)?;
     let line = node.span.as_ref().map_or(1, |span| span.start.line);
-    let name = node.label.trim_end_matches("()");
     let range = locate(&source, from, name, line)?;
     let mut end = range.end;
     if source.as_bytes().get(end) == Some(&b'\n') {
@@ -218,46 +292,88 @@ fn relocation_plan(
     let before = source.get(range.start..end)?.to_owned();
     let declaration = source
         .get(range.start..range.end)?
-        .trim_end_matches(['\n', '\r']);
+        .trim_end_matches(['\n', '\r'])
+        .to_owned();
     let (start_line, start_column) = byte_position(&source, range.start)?;
     let (end_line, end_column) = byte_position(&source, end)?;
     let start_char = utf16_offset(&source, start_line, start_column).ok()?;
     let end_char = utf16_offset(&source, end_line, end_column).ok()?;
-    let mut builder = PlanBuilder::new("move_symbol")
-        .file(from, &sha256_of(&source))
-        .edit(
-            start_line,
-            start_char,
-            end_line,
-            end_char,
-            before,
-            "",
-            "EXTRACTED",
-        );
-    let Some(destination) = read_source(state.root(), to_file) else {
-        return Some(builder.build());
+    Some(MovedText {
+        source,
+        declaration,
+        before,
+        range_start: range.start,
+        range_end: range.end,
+        start_line,
+        start_char,
+        end_line,
+        end_char,
+    })
+}
+
+fn append_declaration(
+    mut builder: PlanBuilder,
+    to_file: &str,
+    destination: &str,
+    name: &str,
+    declaration: &str,
+    carried: &str,
+) -> PlanBuilder {
+    let Some((insert_line, insert_column)) = byte_position(destination, destination.len()) else {
+        return builder;
     };
-    builder = builder.file(to_file, &sha256_of(&destination));
-    builder = remove_sole_import(builder, &destination, name);
-    let (insert_line, insert_column) = byte_position(&destination, destination.len())?;
-    let insert_char = utf16_offset(&destination, insert_line, insert_column).ok()?;
+    let Ok(insert_char) = utf16_offset(destination, insert_line, insert_column) else {
+        return builder;
+    };
     let prefix = if destination.is_empty() || destination.ends_with('\n') {
         ""
     } else {
         "\n"
     };
-    Some(
-        builder
-            .edit(
-                insert_line,
-                insert_char,
-                insert_line,
-                insert_char,
-                "",
-                format!("{prefix}{declaration}\n"),
-                "EXTRACTED",
-            )
-            .build(),
+    builder = builder.file(to_file, &sha256_of(destination));
+    builder = remove_sole_import(builder, destination, name);
+    builder.edit(
+        insert_line,
+        insert_char,
+        insert_line,
+        insert_char,
+        "",
+        format!("{prefix}{carried}{declaration}\n"),
+        "EXTRACTED",
+    )
+}
+
+fn push_import(
+    builder: PlanBuilder,
+    state: &RepositoryState,
+    edit: &super::move_imports::ImportEdit,
+) -> PlanBuilder {
+    let Some(source) = read_source(state.root(), &edit.file) else {
+        return builder;
+    };
+    let Some(before) = source.get(edit.start..edit.end) else {
+        return builder;
+    };
+    let Some((start_line, start_column)) = byte_position(&source, edit.start) else {
+        return builder;
+    };
+    let Some((end_line, end_column)) = byte_position(&source, edit.end) else {
+        return builder;
+    };
+    let (Ok(start_char), Ok(end_char)) = (
+        utf16_offset(&source, start_line, start_column),
+        utf16_offset(&source, end_line, end_column),
+    ) else {
+        return builder;
+    };
+    builder.file(&edit.file, &sha256_of(&source)).edit(
+        start_line,
+        start_char,
+        end_line,
+        end_char,
+        before,
+        edit.after.clone(),
+        "EXTRACTED",
     )
 }
 

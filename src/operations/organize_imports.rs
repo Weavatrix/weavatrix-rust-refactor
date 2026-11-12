@@ -12,8 +12,10 @@
 //!
 //! Rust, Python and Go use the same count, with the cases an occurrence cannot prove left in
 //! place: a CamelCase Rust import (it may be a trait used through its methods), a `pub use`,
-//! a bare Python `import`, and a Go blank or dot import. A language with no recognised import
-//! syntax answers `NO_UNUSED_IMPORTS`.
+//! a bare Python `import`, and a Go blank or dot import. Java, C# and C++ named imports use the
+//! same count. A header, a star and a namespace stay. Kotlin is read from the line, because it
+//! is not a language this parser crate knows. A language with no recognised import syntax
+//! answers `NO_UNUSED_IMPORTS`.
 
 use crate::coordinates::utf16_offset;
 use crate::evidence::read_source;
@@ -26,17 +28,17 @@ use weavatrix_rust::RepositoryState;
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 
 /// One named binding inside `{ ... }`, and the exact bytes it occupies.
-struct Binding {
+pub(super) struct Binding {
     /// The name this file would refer to it by: `z` in `y as z`.
-    local: String,
-    start: usize,
-    end: usize,
+    pub(super) local: String,
+    pub(super) start: usize,
+    pub(super) end: usize,
 }
 
 /// A binding this operation will report and will not delete.
-struct Unnamed {
-    binding: String,
-    reason: &'static str,
+pub(super) struct Unnamed {
+    pub(super) binding: String,
+    pub(super) reason: &'static str,
 }
 
 /// Why a JavaScript default or namespace import is reported rather than removed.
@@ -44,15 +46,15 @@ const JS_UNNAMED: &str = "a default or namespace import can be used by a transfo
      by name, so its occurrences prove nothing";
 
 /// One `import` statement, located but not yet judged.
-struct Import {
+pub(super) struct Import {
     /// The whole statement, `import` through the terminating `;`.
-    start: usize,
-    end: usize,
-    named: Vec<Binding>,
+    pub(super) start: usize,
+    pub(super) end: usize,
+    pub(super) named: Vec<Binding>,
     /// Byte range of the `{ ... }` group, when the statement has one.
-    braces: Option<(usize, usize)>,
+    pub(super) braces: Option<(usize, usize)>,
     /// Bindings that are reported and never removed.
-    unnamed: Vec<Unnamed>,
+    pub(super) unnamed: Vec<Unnamed>,
 }
 
 /// Tokens that carry program meaning, so an identifier in a comment is not a use.
@@ -61,7 +63,7 @@ struct Import {
 /// before it would leave `'./lib.js'` behind after the import was deleted. They cannot be
 /// mistaken for uses either — the tokenizer emits a literal as a single token, so no identifier
 /// is ever produced from inside one.
-fn is_code(token: &Token) -> bool {
+pub(super) fn is_code(token: &Token) -> bool {
     !matches!(
         token.kind,
         TokenKind::Whitespace
@@ -356,6 +358,11 @@ pub(super) fn organize_imports(state: &RepositoryState, arguments: &Value) -> Va
             "reason": format!("{path} is {} bytes; the limit is {MAX_BYTES}", source.len()),
         });
     }
+    if is_kotlin(path) {
+        let statements = super::import_syntax::kotlin_imports(&source);
+        let used = super::import_syntax::textual_names(&source, &statements);
+        return finish(path, &source, &statements, &used, false);
+    }
     let Some(language) = path
         .rsplit_once('.')
         .and_then(|(_, ext)| Language::from_extension(ext))
@@ -375,11 +382,25 @@ pub(super) fn organize_imports(state: &RepositoryState, arguments: &Value) -> Va
             "reason": format!("{language:?} has no import syntax this operation removes"),
         });
     };
-    let candidates: Vec<&Binding> = statements
-        .iter()
-        .flat_map(|statement| statement.named.iter())
-        .collect();
+    let used = uses_outside_imports(&source, &tokens, &statements);
+    let counted = matches!(language, Language::Rust | Language::Python | Language::Go);
+    finish(path, &source, &statements, &used, counted)
+}
 
+fn is_kotlin(path: &str) -> bool {
+    let Some((_, extension)) = path.rsplit_once('.') else {
+        return false;
+    };
+    extension.eq_ignore_ascii_case("kt") || extension.eq_ignore_ascii_case("kts")
+}
+
+fn finish(
+    path: &str,
+    source: &str,
+    statements: &[Import],
+    used: &[String],
+    counted: bool,
+) -> Value {
     if statements.is_empty() {
         return json!({
             "status": "NO_UNUSED_IMPORTS",
@@ -387,9 +408,11 @@ pub(super) fn organize_imports(state: &RepositoryState, arguments: &Value) -> Va
             "reason": "the file declares no static imports",
         });
     }
-
-    let used = uses_outside_imports(&source, &tokens, &statements);
-    let mut builder = PlanBuilder::new("organize_imports").file(path, &sha256_of(&source));
+    let candidates: Vec<&Binding> = statements
+        .iter()
+        .flat_map(|statement| statement.named.iter())
+        .collect();
+    let mut builder = PlanBuilder::new("organize_imports").file(path, &sha256_of(source));
     let mut removed = Vec::new();
     let reported = statements
         .iter()
@@ -402,18 +425,15 @@ pub(super) fn organize_imports(state: &RepositoryState, arguments: &Value) -> Va
             })
         })
         .collect::<Vec<_>>();
-
-    let counted = matches!(language, Language::Rust | Language::Python | Language::Go);
-    for statement in &statements {
+    for statement in statements {
         // A statement that mixes a provable name with one this count cannot prove is left whole.
         // Removing the provable name from beside an uncertain one is how a trait or a side-effect
         // import gets deleted with its neighbour.
         if counted && !statement.unnamed.is_empty() {
             continue;
         }
-        builder = plan_statement(builder, &source, statement, &used, &mut removed);
+        builder = plan_statement(builder, source, statement, used, &mut removed);
     }
-
     if removed.is_empty() {
         return json!({
             "status": "NO_UNUSED_IMPORTS",
@@ -443,6 +463,9 @@ fn statements_of(language: Language, source: &str, tokens: &[Token]) -> Option<V
         Language::Rust => rust_uses(source, tokens),
         Language::Python => python_imports(source, tokens),
         Language::Go => go_imports(source, tokens),
+        Language::Java => super::import_syntax::java_imports(source, tokens),
+        Language::CSharp => super::import_syntax::csharp_imports(source, tokens),
+        Language::C | Language::Cpp => super::import_syntax::cpp_imports(source, tokens),
         _ => return None,
     })
 }

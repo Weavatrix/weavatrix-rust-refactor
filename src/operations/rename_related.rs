@@ -284,6 +284,10 @@ fn apply(root: &std::path::Path, tokens: &TokenStore, arguments: &Value, batch: 
             });
         }
     };
+    let _lock = match super::journal::WriteLock::acquire(root) {
+        Ok(lock) => lock,
+        Err(refusal) => return refusal,
+    };
     let worktree_plan = WorktreePlan::new(
         envelope.operation.clone(),
         envelope
@@ -294,15 +298,19 @@ fn apply(root: &std::path::Path, tokens: &TokenStore, arguments: &Value, batch: 
             .collect(),
     );
     match tree.apply_plan_retained(&worktree_plan, UndoRetention::default()) {
-        Ok(report) => json!({
+        Ok(report) => {
+            let undo_id = report.undo_id().to_string();
+            super::journal::note_apply(root, &undo_id, &[]);
+            json!({
             "status": "APPLIED",
             "transactionId": report.apply().transaction_id(),
-            "undoId": report.undo_id().to_string(),
+            "undoId": undo_id,
             "renames": batch.names.clone(),
             "renamedEdits": batch.total,
             "files": envelope.files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
             "next": "every rename landed in one transaction; rollback_last_apply undoes all of them.",
-        }),
+            })
+        }
         Err(error) => json!({
             "status": "STALE",
             "reason": format!("nothing was written; the batch is unchanged on disk: {error}"),

@@ -570,6 +570,97 @@ fn exclusive_file_delete_plans_an_unused_file() {
 }
 
 #[test]
+fn connected_file_delete_removes_the_import_that_named_it() {
+    let root = repository("file-connected");
+    fs::write(
+        root.join("src/orphan.js"),
+        "export function orphan() { return 1; }\n",
+    )
+    .expect("orphan");
+    fs::write(
+        root.join("src/service.js"),
+        "import { orphan } from \"./orphan.js\";\nexport function health() { return 1; }\n",
+    )
+    .expect("importer");
+    let engine = open(&root);
+    let state = engine.state().clone();
+    let Some(id) = file_node(&state, "src/orphan.js") else {
+        panic!("orphan file is missing");
+    };
+    let session = RefactorSession::new(true);
+    let planned = session
+        .call(
+            &state,
+            "delete_closure",
+            &json!({"symbol": id, "scope": "connected"}),
+        )
+        .expect("declared tool");
+    assert_eq!(status_of(&planned), "PLANNED", "{planned:?}");
+    let plan = planned.get("plan").expect("plan").clone();
+    let preview = session
+        .call(&state, "apply_edit_plan", &json!({"plan": plan.clone()}))
+        .expect("preview");
+    assert_eq!(status_of(&preview), "PREVIEW_OK", "{preview:?}");
+    let token = preview
+        .get("confirmToken")
+        .and_then(Value::as_str)
+        .expect("token")
+        .to_owned();
+    let applied = session
+        .call(
+            &state,
+            "apply_edit_plan",
+            &json!({"plan": plan, "mode": "apply", "confirm_token": token}),
+        )
+        .expect("apply");
+    assert_eq!(status_of(&applied), "APPLIED", "{applied:?}");
+    assert!(!root.join("src/orphan.js").exists());
+    let service = fs::read_to_string(root.join("src/service.js")).expect("service");
+    assert!(!service.contains("orphan.js"), "{service}");
+    assert!(service.contains("function health("), "{service}");
+}
+
+#[test]
+fn a_shared_import_keeps_the_binding_that_was_not_deleted() {
+    let root = repository_with(
+        "shared-import",
+        "\
+import { only, other } from \"./lib.js\";\n\
+const app = { get(path, handler) { return handler; } };\n\
+app.get(\"/only\", only);\n\
+export function keep() { return other(); }\n\
+",
+    );
+    fs::write(
+        root.join("src/lib.js"),
+        "export function only() { return 1; }\nexport function other() { return 2; }\n",
+    )
+    .expect("library");
+    let engine = open(&root);
+    let state = engine.state().clone();
+    let Some(id) = endpoint(&state, "/only") else {
+        panic!("the route is missing from the graph");
+    };
+    let session = RefactorSession::new(true);
+    let planned = session
+        .call(
+            &state,
+            "delete_closure",
+            &json!({"symbol": id, "scope": "exclusive"}),
+        )
+        .expect("declared tool");
+    assert_eq!(status_of(&planned), "PLANNED", "{planned:?}");
+    let service = apply(&session, &state, &root, &planned);
+    assert!(!service.contains("\"/only\""), "{service}");
+    assert!(service.contains("other"), "{service}");
+    assert!(!service.contains("{ only"), "{service}");
+    assert!(service.contains("function keep("), "{service}");
+    let library = fs::read_to_string(root.join("src/lib.js")).expect("library");
+    assert!(!library.contains("function only("), "{library}");
+    assert!(library.contains("function other("), "{library}");
+}
+
+#[test]
 fn a_handler_on_the_next_line_is_part_of_the_route() {
     let root = repository_with(
         "wrapped",
@@ -690,6 +781,10 @@ export function other() { return 1; }\n\
     assert!(
         !service.contains("\"/only\""),
         "the route literal should be gone, got {service}"
+    );
+    assert!(
+        !service.contains("only.js"),
+        "the import of the deleted handler should be gone, got {service}"
     );
     assert!(service.contains("function other("), "{service}");
     assert!(

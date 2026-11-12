@@ -57,16 +57,16 @@ contract fails to compile rather than answering "not supported" at run time.
 | --- | --- | --- |
 | `rename_symbol` | graph + lexical | The declaration, every site the graph proves calls or references it, and the import lines of files the graph proves import the declaring file |
 | `rename_related_symbols` | the same, merged | One transaction for several renames, with collision and contested-site detection; chains and swaps apply simultaneously rather than in sequence |
-| `change_signature` | graph + token-split lists | A parameter added or removed in any indexed language. A typed language copies the previous parameter's type. With a default, existing calls stay; without one they are listed unless a call-site value is given |
-| `organize_imports` | occurrence count | Named bindings whose identifier occurs once. Rust snake_case, Python from-imports and aliases, and Go path segments are counted; traits, `pub use`, bare Python imports, and Go blank or dot imports stay |
-| `edit_symbol` | declaration range | A symbol-anchored replacement or insertion. The end is the matching brace, the indent block, or the signature line. The plan warns that syntax was not checked |
-| `bulk_replace` | lexical | Literal or regex matches in indexed code. Comments and strings are included only with `include_trivia` |
-| `move_file` | specifier arithmetic | The filesystem rename and the relative import specifiers, in one transaction. A missing parent directory is created at apply and left in place on rollback |
-| `move_symbol` | graph | A cycle review plus an edit plan that cuts the declaration into the destination file |
+| `change_signature` | graph + token-split lists | A parameter added or removed in any indexed language, including Kotlin read with the Java tokenizer. A typed language copies the previous parameter's type. With a default, existing calls stay. Without one, proven calls are edited when a call-site value is given. A call the graph missed is edited only when the name is declared once and its argument list can be read; otherwise it is listed. The result stays `PARTIAL` |
+| `organize_imports` | occurrence count | Named bindings whose identifier occurs once. Rust snake_case, Python from-imports and aliases, Go path segments, Java imports, C# usings, C++ using-names, and Kotlin imports are counted. Traits, `pub use`, bare Python imports, Go blank or dot imports, star imports, C++ `#include`, and `using namespace` stay |
+| `edit_symbol` | declaration range | A symbol-anchored replacement or insertion. The end is the matching brace, the indent block, or the signature line. A signature-line end is `PARTIAL` and warns `DECLARATION_END_UNPROVEN`. The plan warns that syntax was not checked |
+| `bulk_replace` | lexical | Literal or regex matches in indexed code. Comments and strings are included only with `include_trivia`. An extension the tokenizer does not know still skips `//` comments, block comments, quotes, and a `#` that starts a line |
+| `move_file` | specifier arithmetic | The filesystem rename and the relative import specifiers, in one transaction. A missing parent directory is created at apply and removed on rollback when it is empty. A non-relative specifier whose last segment is the moved file is reported and the plan stays partial |
+| `move_symbol` | graph | A cycle review plus an edit plan that moves the declaration, retargets the imports it can prove, and copies the imports the declaration uses. The status stays `EVALUATED` |
 | `delete_readiness` | graph | Whether anything still depends on the symbol. A private symbol with no incoming use can be `safe: true`. The verdict stays `REVIEW_REQUIRED` and nothing is written |
 | `delete_closure` | graph | A deletion plan for a symbol or endpoint and the callees only it uses. `exclusive` keeps a shared handler and every other route; `connected` also takes direct referrers |
-| `apply_edit_plan` | `weavatrix-worktree` | Preview, single-use token, atomic write with retained contents |
-| `rollback_last_apply` | `weavatrix-worktree` | The previous contents, restored |
+| `apply_edit_plan` | `weavatrix-worktree` | Preview, single-use token, atomic write with retained contents. A rename missing `from`, `to`, or `sha256`, or a delete missing `path` or `sha256`, refuses the whole plan as `INVALID_PLAN` |
+| `rollback_last_apply` | `weavatrix-worktree` | The newest retained apply, restored. An empty directory created for a rename is removed. A later edit of the same path invalidates the older receipt |
 
 `rename_symbol` and `rename_related_symbols` own their complete two-phase workflow: preview
 returns a plan-bound confirmation token, and repeating the same operation with identical rename
@@ -76,7 +76,7 @@ by the other operations or by an external planner.
 
 ### What "PARTIAL" means here
 
-No planner claims `COMPLETE`. Every call site comes from a graph edge, so these
+A rename never claims `COMPLETE`. Every call site comes from a graph edge, so these
 operations prove the sites they edit — they cannot prove the *absence* of other
 references. A same-named occurrence the graph does not vouch for is reported as an
 `UNPROVEN_OCCURRENCE` rather than edited, which is the whole difference between
@@ -93,18 +93,21 @@ as a path literal. A missing span on a rename is `NOT_A_SYMBOL`.
 
 `organize_imports` counts a name and removes it only when that count proves the
 import is unused. `use std::io::Write` stays: a CamelCase Rust import can be a
-trait used through its methods. `pub use`, a bare Python `import`, and a Go
-blank or dot import stay for the same reason. A snake_case Rust `use`, a Python
-`from` import, and a Go path segment are removed when the name occurs only on
-the import itself. A language with no recognised import syntax answers
-`NO_UNUSED_IMPORTS`.
+trait used through its methods. `pub use`, a bare Python `import`, a Go blank
+or dot import, a star import, a C++ `#include`, and a `using namespace` stay
+for the same reason. A snake_case Rust `use`, a Python `from` import, a Go path
+segment, a Java import, a C# `using`, a C++ `using` name, and a Kotlin `import`
+are removed when the name occurs only on the import itself. A file whose
+extension has no recognised import syntax answers `NO_UNUSED_IMPORTS`.
 
 ## Safety boundary
 
 Producing a plan is a read. Applying one requires all three gates: the host
 exposes the edit capability, `WEAVATRIX_ALLOW_SOURCE_EDITS=1` is set, and the call
-presents a single-use token bound to that exact plan and repository. Nothing in
-this crate writes without them.
+presents a single-use token bound to that exact plan and repository. Source
+bytes go through weavatrix-worktree. Two control files under `.weavatrix`
+record apply order and the cross-process write lock. An empty directory created
+for a rename is removed on rollback.
 
 ## License
 

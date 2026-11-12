@@ -20,7 +20,7 @@ use weavatrix_worktree::{
 ///
 /// Going through the retained-apply path rather than the plain one is what makes
 /// `rollback_last_apply` possible at all: only that path keeps the previous contents.
-fn as_worktree_plan(plan: &EditPlan) -> WorktreePlan {
+fn as_worktree_plan(plan: &EditPlan) -> Result<WorktreePlan, Value> {
     let renames = extension_array(plan, "renames");
     let deletes = extension_array(plan, "deletes");
     let sources = renames
@@ -40,7 +40,7 @@ fn as_worktree_plan(plan: &EditPlan) -> WorktreePlan {
             rename.get("to").and_then(Value::as_str),
             rename.get("sha256").and_then(Value::as_str),
         ) else {
-            continue;
+            return Err(invalid_rename());
         };
         let edits = plan
             .files
@@ -57,7 +57,7 @@ fn as_worktree_plan(plan: &EditPlan) -> WorktreePlan {
             delete.get("path").and_then(Value::as_str),
             delete.get("sha256").and_then(Value::as_str),
         ) else {
-            continue;
+            return Err(invalid_delete());
         };
         operations.push(WorktreeOperation::Delete(DeleteFile::new(path, hash)));
     }
@@ -68,7 +68,26 @@ fn as_worktree_plan(plan: &EditPlan) -> WorktreePlan {
             Some(WorktreeOperation::Modify(file.clone()))
         }
     }));
-    WorktreePlan::new(plan.operation.clone(), operations)
+    Ok(WorktreePlan::new(plan.operation.clone(), operations))
+}
+
+fn invalid_rename() -> Value {
+    json!({
+        "status": "INVALID_PLAN",
+        "reason": "a rename entry is missing from, to, or sha256",
+    })
+}
+
+fn invalid_delete() -> Value {
+    json!({
+        "status": "INVALID_PLAN",
+        "reason": "a delete entry is missing path or sha256",
+    })
+}
+
+enum PreviewError {
+    Tree(WorktreeError),
+    Plan(Value),
 }
 
 fn extension_array<'plan>(plan: &'plan EditPlan, key: &str) -> &'plan [Value] {
@@ -200,31 +219,7 @@ pub(super) fn apply_edit_plan(
     };
 
     if !apply {
-        return match preview_plan(&tree, &plan) {
-            Ok((files, total_edits)) => {
-                let token = tokens.issue(&plan, root);
-                json!({
-                    "status": "PREVIEW_OK",
-                    "files": files,
-                    "totalEdits": total_edits,
-                    "confirmToken": token.value,
-                    "expiresAt": token.expires_at,
-                    "next": "call apply_edit_plan again with the same plan, mode=\"apply\", and this \
-                             confirm_token. The token is single-use and bound to this exact plan \
-                             and repository.",
-                })
-            }
-            // At preview time a moved tree is not an error state to recover from, it is the
-            // answer: this plan cannot be applied, produce a fresh one.
-            Err(error) if is_stale(&error) => json!({
-                "status": "PREVIEW_BLOCKED",
-                "reason": format!(
-                    "the plan does not match the working tree, so nothing can be applied. \
-                     Re-run the producing tool for a fresh plan: {error}"
-                ),
-            }),
-            Err(error) => failure(&error),
-        };
+        return preview_answer(root, tokens, &tree, &plan);
     }
 
     // Gate two is the environment, checked by the host before this runs. Gate three is the token.
@@ -240,55 +235,109 @@ pub(super) fn apply_edit_plan(
     write_plan(root, &tree, &plan)
 }
 
+/// The preview half of `apply_edit_plan`, including a plan the worktree was never asked to read.
+fn preview_answer(root: &Path, tokens: &TokenStore, tree: &Worktree, plan: &EditPlan) -> Value {
+    match preview_plan(tree, plan) {
+        Ok((files, total_edits)) => {
+            let token = tokens.issue(plan, root);
+            json!({
+                "status": "PREVIEW_OK",
+                "files": files,
+                "totalEdits": total_edits,
+                "confirmToken": token.value,
+                "expiresAt": token.expires_at,
+                "next": "call apply_edit_plan again with the same plan, mode=\"apply\", and this \
+                         confirm_token. The token is single-use and bound to this exact plan \
+                         and repository.",
+            })
+        }
+        Err(PreviewError::Plan(refusal)) => refusal,
+        // At preview time a moved tree is not an error state to recover from, it is the
+        // answer: this plan cannot be applied, produce a fresh one.
+        Err(PreviewError::Tree(error)) if is_stale(&error) => json!({
+            "status": "PREVIEW_BLOCKED",
+            "reason": format!(
+                "the plan does not match the working tree, so nothing can be applied. \
+                 Re-run the producing tool for a fresh plan: {error}"
+            ),
+        }),
+        Err(PreviewError::Tree(error)) => failure(&error),
+    }
+}
+
 /// Writes a plan whose gates have all been passed, retaining the previous contents.
 ///
 /// `weavatrix-worktree` 0.2.1 opens every destination parent during validate, and a rename into
 /// a directory that does not exist yet fails before the transaction starts. Those parents are
 /// created here, after the write gates, and only as real directories under the repository.
-/// Rollback restores the file and leaves the new directory in place.
+/// Their paths are recorded with the undo id so rollback can remove them once they are empty.
 fn write_plan(root: &Path, tree: &Worktree, plan: &EditPlan) -> Value {
-    if let Err(refusal) = ensure_destination_parents(root, plan) {
-        return refusal;
-    }
-    match tree.apply_plan_retained(&as_worktree_plan(plan), UndoRetention::default()) {
-        Ok(report) => json!({
-            "status": "APPLIED",
-            "transactionId": report.apply().transaction_id(),
-            "undoId": report.undo_id().to_string(),
-            "files": plan.files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
-            "totalEdits": plan.files.iter().map(|file| file.edits.len()).sum::<usize>(),
-            "next": "the previous contents are retained; rollback_last_apply restores them.",
-        }),
-        Err(error) => failure(&error),
+    let _lock = match super::journal::WriteLock::acquire(root) {
+        Ok(lock) => lock,
+        Err(refusal) => return refusal,
+    };
+    let created = match ensure_destination_parents(root, plan) {
+        Ok(created) => created,
+        Err(refusal) => return refusal,
+    };
+    let operations = match as_worktree_plan(plan) {
+        Ok(operations) => operations,
+        Err(refusal) => {
+            super::journal::prune_empty(root, &created);
+            return refusal;
+        }
+    };
+    match tree.apply_plan_retained(&operations, UndoRetention::default()) {
+        Ok(report) => {
+            let undo_id = report.undo_id().to_string();
+            super::journal::note_apply(root, &undo_id, &created);
+            json!({
+                "status": "APPLIED",
+                "transactionId": report.apply().transaction_id(),
+                "undoId": undo_id,
+                "files": plan.files.iter().map(|file| file.path.clone()).collect::<Vec<_>>(),
+                "totalEdits": plan.files.iter().map(|file| file.edits.len()).sum::<usize>(),
+                "next": "the previous contents are retained; rollback_last_apply restores them.",
+            })
+        }
+        Err(error) => {
+            super::journal::prune_empty(root, &created);
+            failure(&error)
+        }
     }
 }
 
-fn preview_plan(tree: &Worktree, plan: &EditPlan) -> Result<(Vec<Value>, usize), WorktreeError> {
+fn preview_plan(tree: &Worktree, plan: &EditPlan) -> Result<(Vec<Value>, usize), PreviewError> {
     if moves_paths(plan) {
         return preview_moves(tree, plan);
     }
-    tree.dry_run(plan).map(|report| {
-        (
-            report
-                .files()
-                .iter()
-                .map(|file| {
-                    json!({
-                        "path": file.path(),
-                        "status": if file.changed() { "READY" } else { "NO_CHANGE" },
+    tree.dry_run(plan)
+        .map(|report| {
+            (
+                report
+                    .files()
+                    .iter()
+                    .map(|file| {
+                        json!({
+                            "path": file.path(),
+                            "status": if file.changed() { "READY" } else { "NO_CHANGE" },
+                        })
                     })
-                })
-                .collect(),
-            report.total_edits(),
-        )
-    })
+                    .collect(),
+                report.total_edits(),
+            )
+        })
+        .map_err(PreviewError::Tree)
 }
 
-fn preview_moves(tree: &Worktree, plan: &EditPlan) -> Result<(Vec<Value>, usize), WorktreeError> {
-    match tree.dry_run_plan(&as_worktree_plan(plan)) {
+fn preview_moves(tree: &Worktree, plan: &EditPlan) -> Result<(Vec<Value>, usize), PreviewError> {
+    let operations = as_worktree_plan(plan).map_err(PreviewError::Plan)?;
+    match tree.dry_run_plan(&operations) {
         Ok(report) => Ok(operation_ready(&report)),
-        Err(error) if destination_parent_missing(&error, plan) => preview_edits(tree, plan),
-        Err(error) => Err(error),
+        Err(error) if destination_parent_missing(&error, plan) => {
+            preview_edits(tree, plan).map_err(PreviewError::Tree)
+        }
+        Err(error) => Err(PreviewError::Tree(error)),
     }
 }
 
@@ -348,23 +397,55 @@ fn destination_parent_missing(error: &WorktreeError, plan: &EditPlan) -> bool {
         .any(|rename| rename.get("to").and_then(Value::as_str) == Some(path))
 }
 
-fn ensure_destination_parents(root: &Path, plan: &EditPlan) -> Result<(), Value> {
+fn ensure_destination_parents(root: &Path, plan: &EditPlan) -> Result<Vec<String>, Value> {
+    let mut created = Vec::new();
     for rename in extension_array(plan, "renames") {
         let Some(to) = rename.get("to").and_then(Value::as_str) else {
-            continue;
+            return Err(invalid_rename());
         };
         let Some(parent) = confined_parent(root, to)? else {
             continue;
         };
         reject_linked_ancestor(root, &parent)?;
-        std::fs::create_dir_all(&parent).map_err(|error| {
-            json!({
+        created.extend(missing_dirs(root, &parent));
+        if let Err(error) = std::fs::create_dir_all(&parent) {
+            super::journal::prune_empty(root, &created);
+            return Err(json!({
                 "status": "INVALID_PLAN",
                 "reason": format!("could not create the parent of {to}: {error}"),
-            })
-        })?;
+            }));
+        }
     }
-    Ok(())
+    created.sort();
+    created.dedup();
+    Ok(created)
+}
+
+/// Repository-relative directories under `parent` that do not exist yet, shallowest first.
+fn missing_dirs(root: &Path, parent: &Path) -> Vec<String> {
+    let Ok(relative) = parent.strip_prefix(root) else {
+        return Vec::new();
+    };
+    let mut created = Vec::new();
+    let mut cursor = root.to_path_buf();
+    let mut missing = false;
+    for component in relative.components() {
+        cursor.push(component);
+        if !missing && !cursor.exists() {
+            missing = true;
+        }
+        if !missing {
+            continue;
+        }
+        let Ok(created_relative) = cursor.strip_prefix(root) else {
+            continue;
+        };
+        let text = created_relative.to_string_lossy().replace('\\', "/");
+        if !text.is_empty() {
+            created.push(text);
+        }
+    }
+    created
 }
 
 fn confined_parent(root: &Path, to: &str) -> Result<Option<PathBuf>, Value> {
@@ -426,23 +507,44 @@ pub(super) fn rollback_last_apply(root: &std::path::Path, write_allowed: bool) -
         Ok(tree) => tree,
         Err(refusal) => return refusal,
     };
+    let _lock = match super::journal::WriteLock::acquire(root) {
+        Ok(lock) => lock,
+        Err(refusal) => return refusal,
+    };
     let receipts = match tree.undo_receipts() {
         Ok(receipts) => receipts,
         Err(error) => return failure(&error),
     };
-    let Some(latest) = receipts.last() else {
+    let ids = receipts
+        .iter()
+        .map(|receipt| receipt.id().as_str().to_owned())
+        .collect::<Vec<_>>();
+    let Some(latest) = super::journal::latest_undo(root, &ids) else {
         return json!({
             "status": "NO_CHANGE",
             "reason": "no retained apply exists for this repository; there is nothing to roll back",
         });
     };
-    match tree.rollback_undo(latest.id()) {
-        Ok(report) => json!({
-            "status": "ROLLED_BACK",
-            "restored": report.restored_paths(),
-            "rollbackTransactionId": report.rollback_transaction_id(),
-            "next": "run verified_change phase=verify if the refactor is being retried.",
-        }),
+    let Some(receipt) = receipts
+        .iter()
+        .find(|receipt| receipt.id().as_str() == latest)
+    else {
+        return json!({
+            "status": "NO_CHANGE",
+            "reason": "no retained apply exists for this repository; there is nothing to roll back",
+        });
+    };
+    match tree.rollback_undo(receipt.id()) {
+        Ok(report) => {
+            let dirs = super::journal::forget_undo(root, receipt.id().as_str());
+            super::journal::prune_empty(root, &dirs);
+            json!({
+                "status": "ROLLED_BACK",
+                "restored": report.restored_paths(),
+                "rollbackTransactionId": report.rollback_transaction_id(),
+                "next": "run verified_change phase=verify if the refactor is being retried.",
+            })
+        }
         Err(error) => {
             let text = error.to_string();
             json!({

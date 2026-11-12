@@ -158,3 +158,92 @@ fn the_projection_says_it_is_a_projection() {
         "move_symbol emits the plan that cuts the declaration: {answer:?}"
     );
 }
+
+#[test]
+fn applying_the_move_retargets_imports_and_carries_dependencies() {
+    let root = repository(
+        "imports",
+        &[
+            (
+                "src/lib.rs",
+                "pub mod core;\npub mod caller;\npub mod util;\npub mod third;\n",
+            ),
+            (
+                "src/util.rs",
+                "pub fn add(value: u32) -> u32 {\n    value\n}\n",
+            ),
+            (
+                "src/core.rs",
+                "use crate::util::add;\n\npub fn local_add(value: u32) -> u32 {\n    value\n}\n\npub fn helper(value: u32) -> u32 {\n    add(value) + local_add(value)\n}\n\npub fn other() -> u32 {\n    helper(1)\n}\n",
+            ),
+            (
+                "src/caller.rs",
+                "use crate::core::helper;\n\npub fn run() -> u32 {\n    helper(1)\n}\n",
+            ),
+            (
+                "src/third.rs",
+                "use crate::core::helper;\n\npub fn go() -> u32 {\n    helper(2)\n}\n",
+            ),
+        ],
+    );
+    let engine = Weavatrix::open(&root).expect("repository opens");
+    let state = engine.state().clone();
+    let symbol = state
+        .graph()
+        .nodes()
+        .iter()
+        .find(|node| {
+            node.kind == weavatrix_rust::NodeKind::Function
+                && node.label.trim_end_matches("()") == "helper"
+        })
+        .map(|node| node.id.as_str().to_owned())
+        .expect("helper is indexed");
+    let session = RefactorSession::new(true);
+    let planned = session
+        .call(
+            &state,
+            "move_symbol",
+            &json!({"symbol": symbol, "to_file": "src/caller.rs"}),
+        )
+        .expect("declared tool");
+    assert_eq!(status(&planned), "EVALUATED", "{planned:?}");
+    assert_eq!(
+        planned.get("fidelity").and_then(Value::as_str),
+        Some("PROJECTED_FROM_GRAPH_EDGES")
+    );
+    let plan = planned.get("plan").expect("plan").clone();
+    let preview = session
+        .call(&state, "apply_edit_plan", &json!({"plan": plan.clone()}))
+        .expect("preview");
+    assert_eq!(status(&preview), "PREVIEW_OK", "{preview:?}");
+    let token = preview
+        .get("confirmToken")
+        .and_then(Value::as_str)
+        .expect("token")
+        .to_owned();
+    let applied = session
+        .call(
+            &state,
+            "apply_edit_plan",
+            &json!({"plan": plan, "mode": "apply", "confirm_token": token}),
+        )
+        .expect("apply");
+    assert_eq!(status(&applied), "APPLIED", "{applied:?}");
+
+    let core = fs::read_to_string(root.join("src/core.rs")).expect("core");
+    assert!(!core.contains("fn helper"), "{core}");
+    assert!(core.contains("fn local_add"), "{core}");
+    assert!(core.contains("fn other"), "{core}");
+    assert!(core.contains("use crate::caller::helper;"), "{core}");
+
+    let caller = fs::read_to_string(root.join("src/caller.rs")).expect("caller");
+    assert!(caller.contains("fn helper"), "{caller}");
+    assert!(caller.contains("fn run"), "{caller}");
+    assert!(caller.contains("use crate::util::add;"), "{caller}");
+    assert!(caller.contains("use crate::core::local_add;"), "{caller}");
+    assert!(!caller.contains("use crate::core::helper"), "{caller}");
+
+    let third = fs::read_to_string(root.join("src/third.rs")).expect("third");
+    assert!(third.contains("use crate::caller::helper;"), "{third}");
+    assert!(!third.contains("crate::core::helper"), "{third}");
+}

@@ -9,8 +9,10 @@
 //! in `exclusive`, and only the selected route is planned; `connected` takes that handler and its
 //! direct callers too. A function deletion also removes the one route that passes it as a handler.
 //! Two such routes block `exclusive`. A repository is refused. A file nothing else uses is
-//! deleted as a file; exclusive mode refuses a file another file still imports. A symbol with
-//! no source span is `NOT_A_SYMBOL`. The operation returns an edit plan. It does not write.
+//! deleted as a file; exclusive mode refuses a file another file still imports. Connected mode
+//! deletes that file and the relative import statements that name it. A named import of a
+//! deleted symbol is removed in the same plan. A symbol with no source span is `NOT_A_SYMBOL`.
+//! The operation returns an edit plan. It does not write.
 
 use crate::coordinates::{slice_between, utf16_offset};
 use crate::plan::{PlanBuilder, sha256_of};
@@ -209,6 +211,13 @@ fn finish(
     } else {
         Vec::new()
     };
+    let extra =
+        super::delete_imports::statement_spans(state, &[], &removed_symbols(walk, closure), &spans);
+    let mut spans = spans;
+    spans.extend(extra);
+    spans.sort();
+    spans.dedup();
+    let spans = without_nested(&spans);
     match plan_for(state, &spans) {
         Ok(plan) if plan_files(&plan) == 0 => json!({
             "status": "NO_CHANGE",
@@ -1139,7 +1148,34 @@ fn line_span(span: &SourceSpan, text: &str) -> Option<SourceSpan> {
     ))
 }
 
+fn removed_symbols(
+    walk: &Walk<'_>,
+    closure: &Closure,
+) -> Vec<super::delete_imports::RemovedSymbol> {
+    closure
+        .order
+        .iter()
+        .filter_map(|index| {
+            let node = walk.graph.node_at(*index)?;
+            if is_container(&node.kind) {
+                return None;
+            }
+            let file = node.span.as_ref()?.file.clone();
+            let name = node.label.trim_end_matches("()").to_owned();
+            (!name.is_empty()).then_some(super::delete_imports::RemovedSymbol { name, file })
+        })
+        .collect()
+}
+
 fn plan_for(state: &RepositoryState, spans: &[SourceSpan]) -> Result<Value, Value> {
+    Ok(span_edits(PlanBuilder::new("delete_closure"), state, spans)?.build())
+}
+
+fn span_edits(
+    mut builder: PlanBuilder,
+    state: &RepositoryState,
+    spans: &[SourceSpan],
+) -> Result<PlanBuilder, Value> {
     let mut texts: BTreeMap<String, String> = BTreeMap::new();
     for span in spans {
         if texts.contains_key(span.file.as_str()) {
@@ -1185,7 +1221,6 @@ fn plan_for(state: &RepositoryState, spans: &[SourceSpan]) -> Result<Value, Valu
                 before,
             });
     }
-    let mut builder = PlanBuilder::new("delete_closure");
     for (path, edits) in grouped {
         let Some(text) = texts.get(&path) else {
             return Err(super::stale_graph(&path));
@@ -1203,7 +1238,7 @@ fn plan_for(state: &RepositoryState, spans: &[SourceSpan]) -> Result<Value, Valu
             );
         }
     }
-    Ok(builder.build())
+    Ok(builder)
 }
 
 fn plan_files(plan: &Value) -> usize {
@@ -1302,6 +1337,11 @@ fn delete_contained_files(state: &RepositoryState, label: &str, scope: Scope) ->
         };
         builder = builder.delete_path(path, &sha256_of(&text));
     }
+    let imports = super::delete_imports::statement_spans(state, &paths, &[], &[]);
+    builder = match span_edits(builder, state, &imports) {
+        Ok(builder) => builder,
+        Err(refusal) => return refusal,
+    };
     let affected = if scope == Scope::Connected {
         outsider_values(graph, &outsiders)
     } else {

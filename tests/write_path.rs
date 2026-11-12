@@ -233,6 +233,149 @@ fn an_inferred_edit_never_reaches_the_tree() {
 }
 
 #[test]
+fn a_rename_missing_its_hash_refuses_the_whole_plan() {
+    let root = repository("broken-rename");
+    let contents = fs::read_to_string(root.join("src/lib.rs")).expect("source");
+    let (session, state) = session_for(&root, true);
+    let broken = json!({
+        "schemaVersion": "weavatrix.edit-plan.v1",
+        "operation": "move_file",
+        "files": [{
+            "path": "src/lib.rs",
+            "sha256": sha256_of(&contents),
+            "edits": [{
+                "startLine": 1, "startChar": 7, "endLine": 1, "endChar": 10,
+                "before": "one", "after": "uno", "provenance": "EXACT_LSP",
+            }],
+        }],
+        "renames": [{"from": "src/lib.rs", "to": "src/gone/lib.rs"}],
+    });
+    let preview = session
+        .call(&state, "apply_edit_plan", &json!({"plan": broken}))
+        .expect("declared tool");
+    assert_eq!(status(&preview), "INVALID_PLAN", "{preview:?}");
+    let reason = preview.get("reason").and_then(Value::as_str).unwrap_or("");
+    assert!(reason.contains("from, to, or sha256"), "{preview:?}");
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        ORIGINAL
+    );
+    assert!(!root.join("src/gone").exists());
+
+    let deleted = json!({
+        "schemaVersion": "weavatrix.edit-plan.v1",
+        "operation": "delete_closure",
+        "files": [{
+            "path": "src/lib.rs",
+            "sha256": sha256_of(&contents),
+            "edits": [{
+                "startLine": 1, "startChar": 7, "endLine": 1, "endChar": 10,
+                "before": "one", "after": "uno", "provenance": "EXACT_LSP",
+            }],
+        }],
+        "deletes": [{"path": "src/lib.rs"}],
+    });
+    let preview = session
+        .call(&state, "apply_edit_plan", &json!({"plan": deleted}))
+        .expect("declared tool");
+    assert_eq!(status(&preview), "INVALID_PLAN", "{preview:?}");
+    let reason = preview.get("reason").and_then(Value::as_str).unwrap_or("");
+    assert!(reason.contains("path or sha256"), "{preview:?}");
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        ORIGINAL
+    );
+}
+
+#[test]
+fn rollback_undoes_the_newest_apply_and_then_the_one_before_it() {
+    let root = repository("stack");
+    let (session, state) = session_for(&root, true);
+    let first = session
+        .call(&state, "apply_edit_plan", &json!({"plan": plan(&root)}))
+        .expect("declared tool");
+    let token = first
+        .get("confirmToken")
+        .and_then(Value::as_str)
+        .expect("token")
+        .to_owned();
+    let applied = session
+        .call(
+            &state,
+            "apply_edit_plan",
+            &json!({"plan": plan(&root), "mode": "apply", "confirm_token": token}),
+        )
+        .expect("declared tool");
+    assert_eq!(status(&applied), "APPLIED", "{applied:?}");
+
+    // A later apply of the same path invalidates the older receipt. The second
+    // apply therefore edits a different file, which is the stack the worktree can roll.
+    let other = "pub fn two() -> u32 {\n    2\n}\n";
+    fs::write(root.join("src/other.rs"), other).expect("other");
+    let second_plan = json!({
+        "schemaVersion": "weavatrix.edit-plan.v1",
+        "operation": "rename_symbol",
+        "files": [{
+            "path": "src/other.rs",
+            "sha256": sha256_of(other),
+            "edits": [{
+                "startLine": 1, "startChar": 7, "endLine": 1, "endChar": 10,
+                "before": "two", "after": "dos", "provenance": "EXACT_LSP",
+            }],
+        }],
+    });
+    let second = session
+        .call(
+            &state,
+            "apply_edit_plan",
+            &json!({"plan": second_plan.clone()}),
+        )
+        .expect("declared tool");
+    let token = second
+        .get("confirmToken")
+        .and_then(Value::as_str)
+        .expect("token")
+        .to_owned();
+    let applied = session
+        .call(
+            &state,
+            "apply_edit_plan",
+            &json!({"plan": second_plan, "mode": "apply", "confirm_token": token}),
+        )
+        .expect("declared tool");
+    assert_eq!(status(&applied), "APPLIED", "{applied:?}");
+    assert!(
+        fs::read_to_string(root.join("src/other.rs"))
+            .unwrap()
+            .contains("dos")
+    );
+
+    let rolled = session
+        .call(&state, "rollback_last_apply", &json!({}))
+        .expect("declared tool");
+    assert_eq!(status(&rolled), "ROLLED_BACK", "{rolled:?}");
+    assert_eq!(
+        fs::read_to_string(root.join("src/other.rs")).unwrap(),
+        other,
+        "the newest apply rolls back first"
+    );
+    assert!(
+        fs::read_to_string(root.join("src/lib.rs"))
+            .unwrap()
+            .contains("uno")
+    );
+
+    let rolled = session
+        .call(&state, "rollback_last_apply", &json!({}))
+        .expect("declared tool");
+    assert_eq!(status(&rolled), "ROLLED_BACK", "{rolled:?}");
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        ORIGINAL
+    );
+}
+
+#[test]
 fn rolling_back_with_nothing_applied_is_a_status_not_a_failure() {
     let root = repository("empty-undo");
     let (session, state) = session_for(&root, true);

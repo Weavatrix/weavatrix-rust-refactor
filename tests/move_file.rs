@@ -168,6 +168,50 @@ fn applying_the_plan_leaves_every_importer_pointing_at_the_new_path() {
 }
 
 #[test]
+fn rolling_back_a_move_removes_the_directory_it_created() {
+    let root = repository("rollback-dir", &FILES);
+    let engine = Weavatrix::open(&root).expect("repository opens");
+    let session = RefactorSession::new(true);
+    let state = engine.state().clone();
+    let planned = session
+        .call(
+            &state,
+            "move_file",
+            &json!({"from": "src/core.js", "to": "src/deep/core.js"}),
+        )
+        .expect("declared tool");
+    let plan = planned.get("plan").expect("plan").clone();
+    let preview = session
+        .call(&state, "apply_edit_plan", &json!({"plan": plan.clone()}))
+        .expect("declared tool");
+    assert_eq!(status(&preview), "PREVIEW_OK", "{preview:?}");
+    let token = preview
+        .get("confirmToken")
+        .and_then(Value::as_str)
+        .expect("token")
+        .to_owned();
+    let applied = session
+        .call(
+            &state,
+            "apply_edit_plan",
+            &json!({"plan": plan, "mode": "apply", "confirm_token": token}),
+        )
+        .expect("declared tool");
+    assert_eq!(status(&applied), "APPLIED", "{applied:?}");
+    assert!(root.join("src/deep/core.js").is_file());
+
+    let rolled = session
+        .call(&state, "rollback_last_apply", &json!({}))
+        .expect("declared tool");
+    assert_eq!(status(&rolled), "ROLLED_BACK", "{rolled:?}");
+    assert!(root.join("src/core.js").is_file());
+    assert!(
+        !root.join("src/deep").exists(),
+        "rollback removes the empty directory the rename created"
+    );
+}
+
+#[test]
 fn the_moved_file_own_specifiers_are_rewritten_for_the_new_directory() {
     // main.js imports ./core.js from src/; moved to src/deep/ it must climb to ../core.js.
     let root = repository(
@@ -252,5 +296,66 @@ fn module_names_are_left_alone() {
     assert_eq!(
         edits[0].get("before").and_then(Value::as_str),
         Some("./core.js")
+    );
+    assert_eq!(
+        answer.get("completeness").and_then(Value::as_str),
+        Some("COMPLETE"),
+        "a package import that does not name the file is not an uncertain reference"
+    );
+}
+
+#[test]
+fn a_non_relative_import_that_names_the_moved_file_is_partial() {
+    let root = repository(
+        "alias",
+        &[
+            ("src/core.js", "export const value = 1\n"),
+            ("src/main.js", "import {value} from './core.js'\n"),
+            (
+                "src/alias.js",
+                "import {value} from '@/core'\nimport {value as bare} from 'core'\nimport {value as scoped} from '@scope/core.js'\n",
+            ),
+            ("src/other.js", "import react from 'react'\n"),
+        ],
+    );
+    let answer = call(
+        &root,
+        &json!({"from": "src/core.js", "to": "src/deep/core.js"}),
+    );
+    assert_eq!(status(&answer), "PLANNED", "{answer:?}");
+    assert_eq!(
+        answer.get("completeness").and_then(Value::as_str),
+        Some("PARTIAL"),
+        "{answer:?}"
+    );
+    let specs = answer
+        .get("uncertainReferences")
+        .and_then(Value::as_array)
+        .expect("uncertain")
+        .iter()
+        .filter_map(|entry| entry.get("specifier").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(specs.contains(&"@/core"), "{specs:?}");
+    assert!(specs.contains(&"core"), "{specs:?}");
+    assert!(specs.contains(&"@scope/core.js"), "{specs:?}");
+    assert!(!specs.contains(&"react"), "{specs:?}");
+    let before = answer
+        .get("plan")
+        .and_then(|plan| plan.get("files"))
+        .and_then(Value::as_array)
+        .and_then(|files| {
+            files.iter().find(|file| {
+                file.get("edits")
+                    .and_then(Value::as_array)
+                    .is_some_and(|edits| {
+                        edits.iter().any(|edit| {
+                            edit.get("before").and_then(Value::as_str) == Some("./core.js")
+                        })
+                    })
+            })
+        });
+    assert!(
+        before.is_some(),
+        "the relative importer is still rewritten: {answer:?}"
     );
 }

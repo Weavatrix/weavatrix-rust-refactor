@@ -5,8 +5,10 @@
 //! importers' specifiers pointed at the old location and now have to point at the new one.
 //! Missing either leaves a repository that looks refactored and does not build.
 //!
-//! Only relative specifiers are touched. A module name is not a path, and rewriting one would
-//! turn a working import into a broken identifier.
+//! Only relative specifiers are rewritten. A module name is not a path, and rewriting one would
+//! turn a working import into a broken identifier. A non-relative specifier whose last segment
+//! is the moved file's name is left as written and reported, so the plan stays partial instead
+//! of claiming every importer moved.
 
 use crate::coordinates::utf16_offset;
 use crate::evidence::read_source;
@@ -134,6 +136,13 @@ fn importer_imports(
         };
         for import in &facts.imports {
             if !is_relative(&import.specifier) {
+                if names_moved_file(&import.specifier, from) {
+                    uncertain.push(json!({
+                        "file": file,
+                        "specifier": import.specifier,
+                        "reason": "this specifier is not a relative path, so it was not rewritten",
+                    }));
+                }
                 continue;
             }
             let Some(resolved) = resolve(&file, &import.specifier) else {
@@ -190,6 +199,38 @@ fn importer_imports(
     importers.sort_unstable();
     importers.dedup();
     (rewrites, uncertain, importers)
+}
+
+/// Whether a non-relative specifier's last segment is the moved file's name.
+///
+/// `core`, `@/core`, and `@scope/core` name `src/core.js`. `react` does not, and flagging it
+/// would make every real move partial.
+fn names_moved_file(specifier: &str, from: &str) -> bool {
+    let stem = path_stem(from);
+    if stem.is_empty() {
+        return false;
+    }
+    let last = specifier.rsplit(['/', '\\']).next().unwrap_or("");
+    if last.is_empty() {
+        return false;
+    }
+    if last == stem {
+        return true;
+    }
+    let Some((name, extension)) = last.rsplit_once('.') else {
+        return false;
+    };
+    !extension.is_empty()
+        && extension
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+        && name == stem
+}
+
+/// The file name without its last extension: `src/core.js` is `core`.
+fn path_stem(path: &str) -> &str {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    name.rsplit_once('.').map_or(name, |(stem, _)| stem)
 }
 
 pub(super) fn move_file(state: &RepositoryState, arguments: &Value) -> Value {
