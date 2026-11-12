@@ -82,9 +82,13 @@ references. A same-named occurrence the graph does not vouch for is reported as 
 `UNPROVEN_OCCURRENCE` rather than edited, which is the whole difference between
 renaming a symbol and find-replacing a string.
 
-`NOT_SUPPORTED` survives only as a per-call answer, never as the answer for a
-whole tool. `delete_closure` still returns it for a file, module, package, or
-repository, and for a symbol that has no source span. A route label is renamed
+`NOT_SUPPORTED` is no longer the answer for a whole tool. `delete_closure` will
+not delete a repository (`BLOCKED`). A file nothing else uses is a filesystem
+delete; exclusive mode returns `BLOCKED` when another file still imports it.
+A module or package with no source span, and any other symbol with no source
+span, is `NOT_A_SYMBOL`. A handler named on the following line of an unclosed
+`(` is part of that route, including a uniquely named handler in another file.
+A closer line may end with a `//` or `/* */` comment. A route label is renamed
 as a path literal. A missing span on a rename is `NOT_A_SYMBOL`.
 
 Outside JavaScript and TypeScript, `organize_imports` reports candidates and

@@ -8,7 +8,9 @@
 //! An endpoint pulls in the handler it alone serves. A handler another function still calls stays
 //! in `exclusive`, and only the selected route is planned; `connected` takes that handler and its
 //! direct callers too. A function deletion also removes the one route that passes it as a handler.
-//! Two such routes block `exclusive`. The operation returns an edit plan. It does not write.
+//! Two such routes block `exclusive`. A repository is refused. A file nothing else uses is
+//! deleted as a file; exclusive mode refuses a file another file still imports. A symbol with
+//! no source span is `NOT_A_SYMBOL`. The operation returns an edit plan. It does not write.
 
 use crate::coordinates::{slice_between, utf16_offset};
 use crate::plan::{PlanBuilder, sha256_of};
@@ -97,17 +99,21 @@ pub(super) fn delete_closure(state: &RepositoryState, arguments: &Value) -> Valu
     let Some(node) = state.graph().node_at(index) else {
         return super::not_found(state.graph(), symbol);
     };
-    if is_container(&node.kind) {
-        return json!({
-            "status": "NOT_SUPPORTED",
-            "reason": "delete_closure removes a symbol or an endpoint, not a file, module, package, or repository",
-            "symbol": node.label.as_str(),
-            "scope": scope_name(scope),
-        });
+    if node.kind == NodeKind::Repository {
+        return blocked(
+            state.graph(),
+            scope,
+            node.label.as_str(),
+            "delete_closure will not delete a repository",
+            &[],
+        );
+    }
+    if node.kind == NodeKind::File {
+        return delete_contained_files(state, node.label.as_str(), scope);
     }
     if node.span.is_none() {
         return json!({
-            "status": "NOT_SUPPORTED",
+            "status": "NOT_A_SYMBOL",
             "reason": "the selected symbol has no source range, so no deletion was planned",
             "symbol": node.label.as_str(),
             "scope": scope_name(scope),
@@ -475,11 +481,11 @@ fn lexical_handlers(graph: &Graph, endpoint: NodeIndex, text: &str) -> Vec<NodeI
     let Some(span) = graph.node_at(endpoint).and_then(|node| node.span.clone()) else {
         return Vec::new();
     };
-    let Some(line) = nth_line(text, span.start.line) else {
-        return Vec::new();
-    };
+    let statement = route_statement(text, span.start.line);
     let others = other_route_lines(graph, endpoint, &span.file, text);
     let mut found = BTreeSet::new();
+    let mut same_file_names = BTreeSet::new();
+    let mut elsewhere: BTreeMap<String, Vec<NodeIndex>> = BTreeMap::new();
     for node in graph.nodes() {
         if !is_handler_kind(&node.kind) {
             continue;
@@ -487,11 +493,11 @@ fn lexical_handlers(graph: &Graph, endpoint: NodeIndex, text: &str) -> Vec<NodeI
         let Some(body) = node.span.as_ref() else {
             continue;
         };
-        if body.file != span.file {
-            continue;
-        }
         let name = node.label.trim_end_matches("()");
-        if !is_identifier(name) || !mentioned(line, name) || route_callee_only(line, name) {
+        if !is_identifier(name)
+            || !handler_mention(&statement, name)
+            || route_callee_only(&statement, name)
+        {
             continue;
         }
         if others.iter().any(|other| mentioned(other, name)) {
@@ -500,8 +506,22 @@ fn lexical_handlers(graph: &Graph, endpoint: NodeIndex, text: &str) -> Vec<NodeI
         let Some(index) = graph.node_index(node.id.as_str()) else {
             continue;
         };
-        if index != endpoint && !encloses(graph, index, endpoint) {
+        if index == endpoint || encloses(graph, index, endpoint) {
+            continue;
+        }
+        if body.file == span.file {
+            same_file_names.insert(name.to_owned());
             found.insert(index);
+        } else {
+            elsewhere.entry(name.to_owned()).or_default().push(index);
+        }
+    }
+    for (name, indexes) in elsewhere {
+        if same_file_names.contains(&name) || indexes.len() != 1 {
+            continue;
+        }
+        if let Some(index) = indexes.first() {
+            found.insert(*index);
         }
     }
     found.into_iter().collect()
@@ -516,9 +536,52 @@ fn other_route_lines(graph: &Graph, endpoint: NodeIndex, file: &str, text: &str)
         })
         .filter_map(|node| {
             let span = node.span.as_ref()?;
-            (span.file == file).then(|| nth_line(text, span.start.line).map(ToOwned::to_owned))?
+            (span.file == file).then(|| route_statement(text, span.start.line))
         })
         .collect()
+}
+
+/// The route call, including the following lines while `(` is still open.
+fn route_statement(text: &str, start: u32) -> String {
+    let mut lines = Vec::new();
+    let mut debt = 0_i32;
+    let mut line_no = start;
+    for _ in 0..8 {
+        let Some(line) = nth_line(text, line_no) else {
+            break;
+        };
+        lines.push(line.to_owned());
+        debt += paren_debt(line);
+        line_no = line_no.saturating_add(1);
+        if debt <= 0 {
+            break;
+        }
+    }
+    lines.join("\n")
+}
+
+fn paren_debt(line: &str) -> i32 {
+    let mut debt = 0_i32;
+    let mut chars = line.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '(' => debt += 1,
+            ')' => debt -= 1,
+            '/' if chars.peek() == Some(&'/') => break,
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                while let Some(current) = chars.next() {
+                    if current == '*' && chars.peek() == Some(&'/') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            '"' | '\'' | '`' => skip_quoted(&mut chars, character),
+            _ => {}
+        }
+    }
+    debt
 }
 
 fn nth_line(text: &str, line: u32) -> Option<&str> {
@@ -558,10 +621,8 @@ fn lexical_routes(graph: &Graph, function: NodeIndex, text: &str) -> Vec<NodeInd
         if span.file != body.file {
             continue;
         }
-        let Some(line) = nth_line(text, span.start.line) else {
-            continue;
-        };
-        if !handler_mention(line, name) {
+        let statement = route_statement(text, span.start.line);
+        if !handler_mention(&statement, name) {
             continue;
         }
         let Some(index) = graph.node_index(endpoint.id.as_str()) else {
@@ -1006,6 +1067,30 @@ fn skip_quoted(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, quote: char
     }
 }
 
+/// A closer line may carry a trailing `//` or `/* */` comment. `#` stays, so a Rust attribute
+/// is not treated as a comment.
+fn closer_body(rest: &str) -> String {
+    let mut body = String::new();
+    let mut chars = rest.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '/' && chars.peek() == Some(&'/') {
+            break;
+        }
+        if character == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            while let Some(current) = chars.next() {
+                if current == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    break;
+                }
+            }
+            continue;
+        }
+        body.push(character);
+    }
+    body
+}
+
 fn byte_tail(line: &str, column: u32) -> Option<&str> {
     let offset = usize::try_from(column.saturating_sub(1)).ok()?;
     if offset > line.len() || !line.is_char_boundary(offset) {
@@ -1015,7 +1100,8 @@ fn byte_tail(line: &str, column: u32) -> Option<&str> {
 }
 
 fn closer_count(rest: &str) -> Option<i32> {
-    let trimmed = rest.trim();
+    let body = closer_body(rest);
+    let trimmed = body.trim();
     if trimmed.is_empty()
         || !trimmed
             .chars()
@@ -1190,6 +1276,128 @@ fn outsider(graph: &Graph, edge: &Edge, source: NodeIndex) -> Outsider {
         file: span.map(|item| item.file.clone()),
         line: span.map(|item| item.start.line),
     }
+}
+
+fn delete_contained_files(state: &RepositoryState, label: &str, scope: Scope) -> Value {
+    let graph = state.graph();
+    let paths = vec![label.to_owned()];
+    let inside = indexes_in_files(graph, &paths);
+    let outsiders = external_uses(graph, &inside);
+    if scope == Scope::Exclusive && !outsiders.is_empty() {
+        return blocked(
+            graph,
+            scope,
+            label,
+            "another symbol still uses this file; exclusive mode refuses so other contracts stay intact",
+            &outsiders,
+        );
+    }
+    let mut builder = PlanBuilder::new("delete_closure");
+    for path in &paths {
+        let Some(text) = crate::evidence::read_source(state.root(), path) else {
+            return json!({
+                "status": "SOURCE_UNAVAILABLE",
+                "reason": format!("{path} could not be read, so no deletion was planned"),
+            });
+        };
+        builder = builder.delete_path(path, &sha256_of(&text));
+    }
+    let affected = if scope == Scope::Connected {
+        outsider_values(graph, &outsiders)
+    } else {
+        Vec::new()
+    };
+    json!({
+        "status": "PLANNED",
+        "scope": scope_name(scope),
+        "completeness": "PARTIAL",
+        "symbol": label,
+        "deleted": file_rows(graph, &inside),
+        "kept": [],
+        "affected": affected,
+        "plan": builder.build(),
+        "warnings": ["GRAPH_PROVEN_USES_ONLY"],
+        "next": "apply with apply_edit_plan (preview -> confirm). Review kept and affected before confirming.",
+    })
+}
+
+fn indexes_in_files(graph: &Graph, paths: &[String]) -> BTreeSet<NodeIndex> {
+    let mut inside = BTreeSet::new();
+    for node in graph.nodes() {
+        let listed = (node.kind == NodeKind::File && paths.iter().any(|path| path == &node.label))
+            || node
+                .span
+                .as_ref()
+                .is_some_and(|span| paths.iter().any(|path| path == &span.file));
+        if !listed {
+            continue;
+        }
+        if let Some(index) = graph.node_index(node.id.as_str()) {
+            inside.insert(index);
+        }
+    }
+    inside
+}
+
+fn external_uses(graph: &Graph, inside: &BTreeSet<NodeIndex>) -> Vec<Outsider> {
+    let mut found = Vec::new();
+    for edge in graph.edges() {
+        if !is_external_use(&edge.kind) {
+            continue;
+        }
+        let Some(target) = graph.node_index(edge.target.as_str()) else {
+            continue;
+        };
+        if !inside.contains(&target) {
+            continue;
+        }
+        let Some(source) = graph.node_index(edge.source.as_str()) else {
+            continue;
+        };
+        if inside.contains(&source) {
+            continue;
+        }
+        found.push(outsider(graph, edge, source));
+    }
+    found
+}
+
+fn file_rows(graph: &Graph, inside: &BTreeSet<NodeIndex>) -> Vec<Value> {
+    inside
+        .iter()
+        .filter_map(|index| {
+            let node = graph.node_at(*index)?;
+            Some(json!({
+                "id": node.id.as_str(),
+                "symbol": node.label.as_str(),
+                "kind": node.kind.as_str(),
+                "role": if node.kind == NodeKind::File { "file" } else { "contained" },
+                "file": node.span.as_ref().map_or(node.label.as_str(), |span| span.file.as_str()),
+                "line": node.span.as_ref().map(|span| span.start.line),
+            }))
+        })
+        .collect()
+}
+
+fn outsider_values(graph: &Graph, outsiders: &[Outsider]) -> Vec<Value> {
+    outsiders
+        .iter()
+        .filter_map(|item| {
+            let node = graph.node_at(item.source)?;
+            Some(json!({
+                "id": node.id.as_str(),
+                "symbol": node.label.as_str(),
+                "kind": node.kind.as_str(),
+                "relation": item.relation.as_str(),
+                "file": item.file.as_deref(),
+                "line": item.line,
+            }))
+        })
+        .collect()
+}
+
+const fn is_external_use(kind: &EdgeKind) -> bool {
+    is_use(kind) || matches!(kind, EdgeKind::Imports | EdgeKind::ReExports)
 }
 
 fn blocked(

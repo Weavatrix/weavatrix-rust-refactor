@@ -434,6 +434,213 @@ app.get(\"/ready\", health);\n\
     assert!(balanced(&applied), "{applied}");
 }
 
+#[test]
+fn a_repository_is_never_deleted() {
+    let root = repository("repository");
+    let engine = open(&root);
+    let Some(id) = engine
+        .state()
+        .graph()
+        .nodes()
+        .iter()
+        .find(|node| node.kind == NodeKind::Repository)
+        .map(|node| node.id.as_str().to_owned())
+    else {
+        panic!("repository node is missing");
+    };
+    let answer = call(&root, &json!({"symbol": id, "scope": "exclusive"}));
+    assert_eq!(status_of(&answer), "BLOCKED", "{answer:?}");
+    assert!(
+        answer
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason.contains("repository")),
+        "{answer:?}"
+    );
+    assert!(root.join("src/service.js").is_file());
+}
+
+#[test]
+fn a_package_without_a_span_is_not_a_symbol() {
+    let root = repository_with(
+        "package",
+        "import leftPad from \"left-pad\";\nexport function health() { return leftPad(\"ok\"); }\n",
+    );
+    let engine = open(&root);
+    let Some(id) = engine
+        .state()
+        .graph()
+        .nodes()
+        .iter()
+        .find(|node| node.kind == NodeKind::Package)
+        .map(|node| node.id.as_str().to_owned())
+    else {
+        panic!(
+            "package node is missing: {:?}",
+            engine
+                .state()
+                .graph()
+                .nodes()
+                .iter()
+                .map(|node| node.kind.as_str())
+                .collect::<Vec<_>>()
+        );
+    };
+    let answer = call(&root, &json!({"symbol": id}));
+    assert_eq!(status_of(&answer), "NOT_A_SYMBOL", "{answer:?}");
+}
+
+#[test]
+fn exclusive_file_delete_refuses_when_another_file_imports_it() {
+    let root = repository("file-blocked");
+    fs::write(
+        root.join("src/orphan.js"),
+        "export function orphan() { return 1; }\n",
+    )
+    .expect("orphan");
+    fs::write(
+        root.join("src/service.js"),
+        "import { orphan } from \"./orphan.js\";\nexport function health() { return orphan(); }\n",
+    )
+    .expect("importer");
+    let engine = open(&root);
+    let Some(id) = file_node(engine.state(), "src/orphan.js") else {
+        panic!("orphan file is missing");
+    };
+    let answer = call(&root, &json!({"symbol": id, "scope": "exclusive"}));
+    assert_eq!(status_of(&answer), "BLOCKED", "{answer:?}");
+    assert!(root.join("src/orphan.js").is_file());
+}
+
+#[test]
+fn exclusive_file_delete_plans_an_unused_file() {
+    let root = repository("file-unused");
+    fs::write(
+        root.join("src/orphan.js"),
+        "export function orphan() { return 1; }\n",
+    )
+    .expect("orphan");
+    let engine = open(&root);
+    let state = engine.state().clone();
+    let Some(id) = file_node(&state, "src/orphan.js") else {
+        panic!("orphan file is missing");
+    };
+    let session = RefactorSession::new(true);
+    let planned = session
+        .call(
+            &state,
+            "delete_closure",
+            &json!({"symbol": id, "scope": "exclusive"}),
+        )
+        .expect("declared tool");
+    assert_eq!(status_of(&planned), "PLANNED", "{planned:?}");
+    let paths = planned
+        .get("plan")
+        .and_then(|plan| plan.get("deletes"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("path").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert_eq!(paths, ["src/orphan.js"], "{planned:?}");
+    let plan = planned.get("plan").expect("plan").clone();
+    let preview = session
+        .call(&state, "apply_edit_plan", &json!({"plan": plan.clone()}))
+        .expect("preview");
+    assert_eq!(status_of(&preview), "PREVIEW_OK", "{preview:?}");
+    let token = preview
+        .get("confirmToken")
+        .and_then(Value::as_str)
+        .expect("token")
+        .to_owned();
+    let applied = session
+        .call(
+            &state,
+            "apply_edit_plan",
+            &json!({"plan": plan, "mode": "apply", "confirm_token": token}),
+        )
+        .expect("apply");
+    assert_eq!(status_of(&applied), "APPLIED", "{applied:?}");
+    assert!(!root.join("src/orphan.js").exists());
+    assert!(root.join("src/service.js").is_file());
+}
+
+#[test]
+fn a_handler_on_the_next_line_is_part_of_the_route() {
+    let root = repository_with(
+        "wrapped",
+        "\
+export function only() {\n\
+  return 1;\n\
+}\n\
+const app = { get(path, handler) { return handler; } };\n\
+app.get(\"/only\",\n\
+  only);\n\
+",
+    );
+    let engine = open(&root);
+    let state = engine.state().clone();
+    let Some(id) = symbol(&state, "only") else {
+        panic!("only is missing");
+    };
+    let session = RefactorSession::new(true);
+    let planned = session
+        .call(
+            &state,
+            "delete_closure",
+            &json!({"symbol": id, "scope": "exclusive"}),
+        )
+        .expect("declared tool");
+    assert_eq!(status_of(&planned), "PLANNED", "{planned:?}");
+    let source = apply(&session, &state, &root, &planned);
+    assert!(!source.contains("function only("), "{source}");
+    assert!(!source.contains("/only"), "{source}");
+    assert!(balanced(&source), "{source}");
+}
+
+#[test]
+fn a_trailing_comment_on_the_closer_is_removed_with_the_function() {
+    let root = repository_with(
+        "closer",
+        "\
+export function only() {\n\
+  return 1;\n\
+} // end\n\
+",
+    );
+    let engine = open(&root);
+    let state = engine.state().clone();
+    let Some(id) = symbol(&state, "only") else {
+        panic!("only is missing");
+    };
+    let session = RefactorSession::new(true);
+    let planned = session
+        .call(
+            &state,
+            "delete_closure",
+            &json!({"symbol": id, "scope": "exclusive"}),
+        )
+        .expect("declared tool");
+    assert_eq!(status_of(&planned), "PLANNED", "{planned:?}");
+    let source = apply(&session, &state, &root, &planned);
+    assert!(!source.contains("function only("), "{source}");
+    assert!(!source.contains("// end"), "{source}");
+    assert!(balanced(&source), "{source}");
+}
+
+fn file_node(state: &RepositoryState, path: &str) -> Option<String> {
+    state
+        .graph()
+        .nodes()
+        .iter()
+        .find(|node| node.kind == NodeKind::File && node.label == path)
+        .map(|node| node.id.as_str().to_owned())
+}
+
 fn balanced(source: &str) -> bool {
     let mut depth = 0_i32;
     for character in source.chars() {
