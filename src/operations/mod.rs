@@ -28,6 +28,7 @@ mod text_scan;
 use crate::contract;
 use crate::token::TokenStore;
 use blazingly_json::{Value, json};
+use std::path::Path;
 use weavatrix_rust::RepositoryState;
 
 /// One server's refactor surface: the confirmations it has issued and whether it may write.
@@ -61,6 +62,10 @@ impl RefactorSession {
 
     /// Calls one refactor operation.
     ///
+    /// The repository lock is taken before the operation reads or writes. Readers share it. A
+    /// call that will apply or roll back takes it alone when the write gate is open. A
+    /// conflicting lock is `REPO_BUSY` and does not spend a confirm token.
+    ///
     /// # Errors
     ///
     /// Returns an error only when `name` is not a tool the contract declares. Every other
@@ -74,6 +79,12 @@ impl RefactorSession {
     ) -> Result<Value, String> {
         let Some(operation) = Operation::from_name(name) else {
             return Err(format!("unknown refactor operation: {name}"));
+        };
+        // The host may already hold this lock across the graph refresh. Taking it again on
+        // the same thread reenters; it does not refuse the call that owns the lock.
+        let _guard = match repository_guard(state.root(), name, arguments, self.write_allowed) {
+            Ok(guard) => guard,
+            Err(refusal) => return Ok(refusal),
         };
         Ok(match operation {
             Operation::DeleteReadiness => delete_readiness::delete_readiness(state, arguments),
@@ -173,6 +184,50 @@ impl Operation {
             Self::DeleteReadiness => "delete_readiness",
             Self::DeleteClosure => "delete_closure",
         }
+    }
+}
+
+/// Holds one repository while a call reads or writes it.
+///
+/// Dropping the guard releases the lock. The same thread may acquire it again; another
+/// thread or process gets `REPO_BUSY` instead of waiting.
+#[must_use = "dropping the guard releases the repository"]
+pub struct RepositoryGuard {
+    _lock: journal::RepoLock,
+}
+
+/// Locks `root` for one refactor call.
+///
+/// A shared lock covers planning and preview. An exclusive lock covers `rollback_last_apply`
+/// and any other writing tool whose `mode` is `"apply"`, and only when `write_allowed` is
+/// set. A closed gate cannot write, so that call stays a reader.
+///
+/// # Errors
+///
+/// Returns `REPO_BUSY` when another process holds a conflicting lock, when this thread is
+/// already inside a different repository, or when a read on this thread would have to become
+/// a write.
+pub fn repository_guard(
+    root: &Path,
+    name: &str,
+    arguments: &Value,
+    write_allowed: bool,
+) -> Result<RepositoryGuard, Value> {
+    let lock = journal::acquire(root, write_allowed && intends_to_write(name, arguments))?;
+    Ok(RepositoryGuard { _lock: lock })
+}
+
+/// Whether this call will change the tree when the write gate is open.
+///
+/// Preview uses the same tools as apply. The mode is what distinguishes them. Rollback has
+/// no mode and always intends to write.
+fn intends_to_write(name: &str, arguments: &Value) -> bool {
+    match Operation::from_name(name) {
+        Some(Operation::RollbackLastApply) => true,
+        Some(operation) if operation.writes() => {
+            arguments.get("mode").and_then(Value::as_str) == Some("apply")
+        }
+        _ => false,
     }
 }
 

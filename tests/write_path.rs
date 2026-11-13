@@ -376,6 +376,74 @@ fn rollback_undoes_the_newest_apply_and_then_the_one_before_it() {
 }
 
 #[test]
+fn a_busy_repository_keeps_the_confirm_token() {
+    let root = repository("busy");
+    let (session, state) = session_for(&root, true);
+    let preview = session
+        .call(&state, "apply_edit_plan", &json!({"plan": plan(&root)}))
+        .expect("declared tool");
+    assert_eq!(status(&preview), "PREVIEW_OK", "{preview:?}");
+    let token = preview
+        .get("confirmToken")
+        .and_then(Value::as_str)
+        .expect("token")
+        .to_owned();
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let probe = root.clone();
+    let holder = std::thread::spawn(move || {
+        let guard = weavatrix_rust_refactor::operations::repository_guard(
+            &probe,
+            "rollback_last_apply",
+            &json!({}),
+            true,
+        )
+        .expect("holder");
+        ready_tx.send(()).expect("ready");
+        release_rx.recv().expect("release");
+        drop(guard);
+    });
+    ready_rx.recv().expect("held");
+    let busy = session
+        .call(
+            &state,
+            "apply_edit_plan",
+            &json!({
+                "plan": plan(&root),
+                "mode": "apply",
+                "confirm_token": token.clone(),
+            }),
+        )
+        .expect("declared tool");
+    assert_eq!(status(&busy), "REPO_BUSY", "{busy:?}");
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        ORIGINAL
+    );
+    release_tx.send(()).expect("release");
+    holder.join().expect("holder");
+
+    let applied = session
+        .call(
+            &state,
+            "apply_edit_plan",
+            &json!({
+                "plan": plan(&root),
+                "mode": "apply",
+                "confirm_token": token,
+            }),
+        )
+        .expect("declared tool");
+    assert_eq!(status(&applied), "APPLIED", "{applied:?}");
+    assert!(
+        fs::read_to_string(root.join("src/lib.rs"))
+            .unwrap()
+            .contains("uno")
+    );
+}
+
+#[test]
 fn rolling_back_with_nothing_applied_is_a_status_not_a_failure() {
     let root = repository("empty-undo");
     let (session, state) = session_for(&root, true);

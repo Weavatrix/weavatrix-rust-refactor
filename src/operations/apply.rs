@@ -161,6 +161,10 @@ pub(super) fn apply_generated_plan(
             });
         }
     };
+    let _lock = match super::journal::acquire(root, true) {
+        Ok(lock) => lock,
+        Err(refusal) => return refusal,
+    };
     if let Some(refusal) = tokens.consume(confirm_token, &plan, root) {
         return refusal;
     }
@@ -184,6 +188,12 @@ pub(super) fn apply_edit_plan(
 ) -> Value {
     let apply = arguments.get("mode").and_then(Value::as_str) == Some("apply");
     let presented = arguments.get("confirm_token").and_then(Value::as_str);
+    // Taken before the token is spent. A busy repository can be retried with the same token.
+    // A shared lock covers preview, so it does not read a file another process is writing.
+    let _lock = match super::journal::acquire(root, write_allowed && apply) {
+        Ok(lock) => lock,
+        Err(refusal) => return refusal,
+    };
     if apply && arguments.get("plan").is_none() {
         if !write_allowed {
             return json!({
@@ -272,7 +282,7 @@ fn preview_answer(root: &Path, tokens: &TokenStore, tree: &Worktree, plan: &Edit
 /// created here, after the write gates, and only as real directories under the repository.
 /// Their paths are recorded with the undo id so rollback can remove them once they are empty.
 fn write_plan(root: &Path, tree: &Worktree, plan: &EditPlan) -> Value {
-    let _lock = match super::journal::WriteLock::acquire(root) {
+    let _lock = match super::journal::acquire(root, true) {
         Ok(lock) => lock,
         Err(refusal) => return refusal,
     };
@@ -503,12 +513,12 @@ pub(super) fn rollback_last_apply(root: &std::path::Path, write_allowed: bool) -
             "reason": "the server was started without source edits enabled",
         });
     }
-    let tree = match worktree(root) {
-        Ok(tree) => tree,
+    let _lock = match super::journal::acquire(root, true) {
+        Ok(lock) => lock,
         Err(refusal) => return refusal,
     };
-    let _lock = match super::journal::WriteLock::acquire(root) {
-        Ok(lock) => lock,
+    let tree = match worktree(root) {
+        Ok(tree) => tree,
         Err(refusal) => return refusal,
     };
     let receipts = match tree.undo_receipts() {

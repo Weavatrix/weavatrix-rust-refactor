@@ -16,7 +16,9 @@
 //!
 //! Producing a plan is a read. Applying one requires all three gates: the host exposes the edit
 //! capability, `WEAVATRIX_ALLOW_SOURCE_EDITS=1` is set, and the call presents a single-use token
-//! bound to that exact plan and repository. Nothing in this crate writes without them.
+//! bound to that exact plan and repository. Every call takes a repository lock first: readers
+//! share it, and a writer takes it alone. A busy repository answers `REPO_BUSY` before a confirm
+//! token is spent. Nothing in this crate writes source without the three gates.
 
 pub mod contract;
 pub mod coordinates;

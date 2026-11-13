@@ -106,8 +106,10 @@ Producing a plan is a read. Applying one requires all three gates: the host
 exposes the edit capability, `WEAVATRIX_ALLOW_SOURCE_EDITS=1` is set, and the call
 presents a single-use token bound to that exact plan and repository. Source
 bytes go through weavatrix-worktree. Two control files under `.weavatrix`
-record apply order and the cross-process write lock. An empty directory created
-for a rename is removed on rollback.
+record apply order and the cross-process lock. Readers share that lock. A writer
+returns `REPO_BUSY` to other processes, and an apply that finds the repository
+busy keeps its confirm token. An empty directory created for a rename is removed
+on rollback.
 
 ## License
 

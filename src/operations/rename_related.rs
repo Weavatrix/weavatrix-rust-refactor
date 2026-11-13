@@ -270,8 +270,13 @@ fn apply(root: &std::path::Path, tokens: &TokenStore, arguments: &Value, batch: 
         Err(error) => return json!({"status": error.code, "reason": error.reason}),
     };
     let presented = arguments.get("confirm_token").and_then(Value::as_str);
+    let _lock = match super::journal::acquire(root, true) {
+        Ok(lock) => lock,
+        Err(refusal) => return refusal,
+    };
     // The token is bound to the plan, and the plan was just recomputed from the current graph.
     // A batch whose sites moved therefore fails here rather than writing something else.
+    // The lock is already held, so a busy repository does not spend the token.
     if let Some(refusal) = tokens.consume(presented, &envelope, root) {
         return refusal;
     }
@@ -283,10 +288,6 @@ fn apply(root: &std::path::Path, tokens: &TokenStore, arguments: &Value, batch: 
                 "reason": format!("the repository could not be opened for writing: {error}"),
             });
         }
-    };
-    let _lock = match super::journal::WriteLock::acquire(root) {
-        Ok(lock) => lock,
-        Err(refusal) => return refusal,
     };
     let worktree_plan = WorktreePlan::new(
         envelope.operation.clone(),

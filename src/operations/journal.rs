@@ -6,15 +6,25 @@
 //! once they are empty again. The worktree restores file bytes and leaves those directories.
 
 use blazingly_json::{Map, Value, json};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
 
 const JOURNAL_NAME: &str = "refactor-journal.json";
 const LOCK_NAME: &str = "refactor-write.lock";
-const STALE_AFTER: Duration = Duration::from_secs(10 * 60);
+
+struct HeldLock {
+    root: PathBuf,
+    exclusive: bool,
+    depth: u32,
+    file: Option<File>,
+}
+
+thread_local! {
+    #[allow(clippy::missing_const_for_thread_local)]
+    static HELD: RefCell<Option<HeldLock>> = const { RefCell::new(None) };
+}
 
 struct Journal {
     undos: Vec<String>,
@@ -203,43 +213,119 @@ fn busy(reason: impl Into<String>) -> Value {
     })
 }
 
-/// A process-wide write lock for one repository.
+/// The repository lock for one call.
 ///
-/// The same process already serialises a repository on one lane. A second process — another
-/// agent, or the CLI — does not share that lane. The lock is the file's existence. It is not a
-/// held handle, so a crash leaves it behind and the next writer takes it after ten minutes.
+/// Readers share it. A writer takes it alone, so a second process cannot observe a file
+/// halfway through an apply. The same thread can take it again: the host holds it across the
+/// graph refresh, and the write then takes it before spending a confirm token. A crash closes
+/// the handle and releases the lock. The file itself stays.
+///
+/// The guard stays on the thread that took it. Sending it elsewhere would drop the wrong
+/// thread-local and leave the file locked.
 #[must_use]
-pub(super) struct WriteLock {
-    path: PathBuf,
+pub(super) struct RepoLock {
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-impl WriteLock {
-    pub(super) fn acquire(root: &Path) -> Result<Self, Value> {
-        let dir = control_dir(root);
-        if linked(&dir) {
-            return Err(busy("the repository control directory is a symbolic link"));
-        }
-        if let Err(error) = std::fs::create_dir_all(&dir) {
-            return Err(busy(format!(
-                "the repository could not be locked for writing: {error}"
-            )));
-        }
-        let path = dir.join(LOCK_NAME);
-        if linked(&path) {
-            return Err(busy("the repository write lock is a symbolic link"));
-        }
-        if create_lock(&path)
-            || (stale(&path) && std::fs::remove_file(&path).is_ok() && create_lock(&path))
-        {
-            return Ok(Self { path });
-        }
-        Err(busy("another process is writing this repository"))
+pub(super) fn acquire(root: &Path, exclusive: bool) -> Result<RepoLock, Value> {
+    let root = canonical_root(root)?;
+    if let Some(answer) = reenter(&root, exclusive) {
+        return answer;
+    }
+    let file = open_lock(&root)?;
+    lock_handle(&file, exclusive)?;
+    HELD.with(|slot| {
+        *slot.borrow_mut() = Some(HeldLock {
+            root,
+            exclusive,
+            depth: 1,
+            file: Some(file),
+        });
+    });
+    Ok(RepoLock {
+        _thread: std::marker::PhantomData,
+    })
+}
+
+impl Drop for RepoLock {
+    fn drop(&mut self) {
+        HELD.with(|slot| {
+            let mut held = slot.borrow_mut();
+            let Some(state) = held.as_mut() else {
+                return;
+            };
+            state.depth = state.depth.saturating_sub(1);
+            if state.depth == 0 {
+                if let Some(file) = state.file.take() {
+                    let _ = file.unlock();
+                }
+                *held = None;
+            }
+        });
     }
 }
 
-impl Drop for WriteLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+fn reenter(root: &Path, exclusive: bool) -> Option<Result<RepoLock, Value>> {
+    HELD.with(|slot| {
+        let mut held = slot.borrow_mut();
+        let state = held.as_mut()?;
+        if state.root != root {
+            return Some(Err(busy("this thread is already using another repository")));
+        }
+        if exclusive && !state.exclusive {
+            return Some(Err(busy(
+                "a read of this repository is already in progress on this thread",
+            )));
+        }
+        state.depth += 1;
+        Some(Ok(RepoLock {
+            _thread: std::marker::PhantomData,
+        }))
+    })
+}
+
+fn canonical_root(root: &Path) -> Result<PathBuf, Value> {
+    root.canonicalize()
+        .map_err(|_| busy(format!("repository {} is not a directory", root.display())))
+}
+
+fn open_lock(root: &Path) -> Result<File, Value> {
+    let dir = control_dir(root);
+    if linked(&dir) {
+        return Err(busy("the repository control directory is a symbolic link"));
+    }
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        return Err(busy(format!("the repository could not be locked: {error}")));
+    }
+    let path = dir.join(LOCK_NAME);
+    if linked(&path) {
+        return Err(busy("the repository lock is a symbolic link"));
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| busy(format!("the repository could not be locked: {error}")))
+}
+
+fn lock_handle(file: &File, exclusive: bool) -> Result<(), Value> {
+    let result = if exclusive {
+        file.try_lock()
+    } else {
+        file.try_lock_shared()
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => Err(busy(if exclusive {
+            "another process is reading or writing this repository"
+        } else {
+            "another process is writing this repository"
+        })),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(busy(format!("the repository could not be locked: {error}")))
+        }
     }
 }
 
@@ -248,30 +334,9 @@ fn linked(path: &Path) -> bool {
         .is_ok_and(|meta| meta.file_type().is_symlink())
 }
 
-fn create_lock(path: &Path) -> bool {
-    let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(path) else {
-        return false;
-    };
-    let _ = writeln!(file, "{}", std::process::id());
-    true
-}
-
-fn stale(path: &Path) -> bool {
-    if linked(path) {
-        return false;
-    }
-    let Ok(meta) = path.metadata() else {
-        return true;
-    };
-    let Ok(modified) = meta.modified() else {
-        return false;
-    };
-    modified.elapsed().is_ok_and(|age| age >= STALE_AFTER)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{WriteLock, forget_undo, latest_undo, note_apply, prune_empty};
+    use super::{acquire, forget_undo, latest_undo, note_apply, prune_empty};
 
     fn root(name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("wvxr-journal-{name}-{}", std::process::id()));
@@ -318,23 +383,52 @@ mod tests {
         assert!(root.join("src/keep.txt").exists());
     }
 
+    /// The guard cannot cross a thread. The probe drops it where it was taken.
+    fn other_thread(root: &std::path::Path, exclusive: bool) -> String {
+        let root = root.to_path_buf();
+        std::thread::spawn(move || match acquire(&root, exclusive) {
+            Ok(lock) => {
+                drop(lock);
+                "ok".to_owned()
+            }
+            Err(refusal) => refusal
+                .get("status")
+                .and_then(blazingly_json::Value::as_str)
+                .unwrap_or("other")
+                .to_owned(),
+        })
+        .join()
+        .expect("probe")
+    }
+
     #[test]
     fn a_held_lock_refuses_a_second_writer_and_releases_on_drop() {
         let root = root("lock");
-        let first = WriteLock::acquire(&root).expect("first");
-        match WriteLock::acquire(&root) {
-            Err(refusal) => assert_eq!(
-                refusal
-                    .get("status")
-                    .and_then(blazingly_json::Value::as_str),
-                Some("REPO_BUSY")
-            ),
-            Ok(lock) => {
-                drop(lock);
-                panic!("a second writer acquired the lock");
-            }
-        }
+        let first = acquire(&root, true).expect("first");
+        assert_eq!(other_thread(&root, true), "REPO_BUSY");
         drop(first);
-        assert!(WriteLock::acquire(&root).is_ok());
+        assert_eq!(other_thread(&root, true), "ok");
+    }
+
+    #[test]
+    fn readers_share_a_repository_and_exclude_a_writer() {
+        let root = root("readers");
+        let first = acquire(&root, false).expect("reader");
+        assert_eq!(other_thread(&root, false), "ok");
+        assert_eq!(other_thread(&root, true), "REPO_BUSY");
+        drop(first);
+        assert_eq!(other_thread(&root, true), "ok");
+    }
+
+    #[test]
+    fn a_lock_taken_by_this_thread_can_be_taken_again() {
+        let root = root("reenter");
+        let outer = acquire(&root, true).expect("outer");
+        let inner = acquire(&root, false).expect("covered read");
+        assert_eq!(other_thread(&root, false), "REPO_BUSY");
+        drop(inner);
+        assert_eq!(other_thread(&root, true), "REPO_BUSY");
+        drop(outer);
+        assert_eq!(other_thread(&root, false), "ok");
     }
 }
