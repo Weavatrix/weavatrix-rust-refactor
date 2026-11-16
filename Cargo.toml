@@ -1,6 +1,6 @@
 [package]
 name = "weavatrix-rust-refactor"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 rust-version = "1.89"
 description = "Evidence-backed refactor operations for Weavatrix: plan production, transactional application, and rollback"
@@ -19,6 +19,7 @@ path = "src/lib.rs"
 blazingly-json = "0.1.0"
 # Pinned to the version weavatrix-rust resolves, so both see one graph type rather than two
 # structurally identical ones that will not convert.
+proc-macro2 = { version = "1", features = ["span-locations"] }
 regex = "1"
 syn = { version = "3", features = ["full"] }
 weavatrix-graph = "0.6.3"

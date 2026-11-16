@@ -1,6 +1,6 @@
 //! The refactor operation surface.
 //!
-//! Dispatch is total and every arm is a native engine — all thirteen of the frozen tools answer
+//! Dispatch is total and every arm is a native engine — all sixteen of the frozen tools answer
 //! for themselves, and the match has no fallback arm, so adding a tool to the contract fails to
 //! compile rather than quietly returning "not supported" at run time.
 //!
@@ -14,6 +14,9 @@ mod delete_closure;
 mod delete_imports;
 mod delete_readiness;
 mod edit_symbol;
+mod edits;
+mod extract_duplicate;
+mod extract_window;
 mod import_syntax;
 mod journal;
 mod move_file;
@@ -23,6 +26,8 @@ mod organize_imports;
 mod remove_duplicates;
 mod rename_related;
 mod rename_symbol;
+mod rust_type;
+mod share_method_body;
 mod signature;
 mod syntax_gate;
 mod text_scan;
@@ -114,6 +119,9 @@ impl RefactorSession {
             Operation::ChangeSignature => change_signature::change_signature(state, arguments),
             Operation::DeleteClosure => delete_closure::delete_closure(state, arguments),
             Operation::RemoveDuplicates => remove_duplicates::remove_duplicates(state, arguments),
+            Operation::ExtractDuplicate => extract_duplicate::extract_duplicate(state, arguments),
+            Operation::ExtractWindow => extract_window::extract_window(state, arguments),
+            Operation::ShareMethodBody => share_method_body::share_method_body(state, arguments),
         })
     }
 }
@@ -134,6 +142,9 @@ pub enum Operation {
     DeleteReadiness,
     DeleteClosure,
     RemoveDuplicates,
+    ExtractDuplicate,
+    ExtractWindow,
+    ShareMethodBody,
 }
 
 impl Operation {
@@ -154,6 +165,9 @@ impl Operation {
             "delete_readiness" => Some(Self::DeleteReadiness),
             "delete_closure" => Some(Self::DeleteClosure),
             "remove_duplicates" => Some(Self::RemoveDuplicates),
+            "extract_duplicate" => Some(Self::ExtractDuplicate),
+            "extract_window" => Some(Self::ExtractWindow),
+            "share_method_body" => Some(Self::ShareMethodBody),
             _ => None,
         }
     }
@@ -190,6 +204,9 @@ impl Operation {
             Self::DeleteReadiness => "delete_readiness",
             Self::DeleteClosure => "delete_closure",
             Self::RemoveDuplicates => "remove_duplicates",
+            Self::ExtractDuplicate => "extract_duplicate",
+            Self::ExtractWindow => "extract_window",
+            Self::ShareMethodBody => "share_method_body",
         }
     }
 }

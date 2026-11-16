@@ -613,3 +613,241 @@ fn rename_apply_and_rollback_restore_the_bytes() {
         source
     );
 }
+
+fn check_compiles(root: &Path) {
+    let output = std::process::Command::new("cargo")
+        .args(["check", "--offline", "--quiet", "--manifest-path"])
+        .arg(root.join("Cargo.toml"))
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .output()
+        .expect("cargo check");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn plan_text(answer: &Value) -> String {
+    format!("{:?}", answer.get("plan"))
+}
+
+#[test]
+fn extract_duplicate_retargets_the_used_copy() {
+    let body = "fn ordered_sel(items: &[u32]) -> Vec<u32> {\n    let mut out = items.to_vec();\n    out.sort_unstable();\n    out\n}\n";
+    let root = repository(
+        "extract-dup",
+        &[
+            ("src/lib.rs", "pub mod app;\npub mod ui;\n"),
+            (
+                "src/app.rs",
+                &format!(
+                    "{body}\npub fn show(items: &[u32]) -> Vec<u32> {{\n    ordered_sel(items)\n}}\n"
+                ),
+            ),
+            (
+                "src/ui.rs",
+                &format!(
+                    "{body}\npub fn paint(items: &[u32]) -> Vec<u32> {{\n    ordered_sel(items)\n}}\n"
+                ),
+            ),
+        ],
+    );
+    let engine = open(&root);
+    let state = engine.state().clone();
+    let session = RefactorSession::new(true);
+    let answer = session
+        .call(&state, "extract_duplicate", &json!({}))
+        .expect("tool");
+    expect_status(&answer, "PLANNED");
+    let deleted = answer
+        .get("deleted")
+        .and_then(Value::as_array)
+        .expect("deleted");
+    assert_eq!(deleted.len(), 1, "{answer:?}");
+    assert_eq!(
+        deleted[0].get("file").and_then(Value::as_str),
+        Some("src/ui.rs"),
+        "{answer:?}"
+    );
+    let plan = plan_text(&answer);
+    assert!(plan.contains("pub(crate)"), "{plan}");
+    assert!(plan.contains("crate::app::ordered_sel"), "{plan}");
+    apply(&session, &state, answer.get("plan").expect("plan"));
+    let app = fs::read_to_string(root.join("src/app.rs")).expect("app");
+    let ui = fs::read_to_string(root.join("src/ui.rs")).expect("ui");
+    assert!(app.contains("pub(crate) fn ordered_sel"), "{app}");
+    assert!(ui.contains("crate::app::ordered_sel"), "{ui}");
+    assert!(!ui.contains("fn ordered_sel"), "{ui}");
+    check_compiles(&root);
+}
+
+#[test]
+fn extract_duplicate_leaves_an_unused_copy_for_remove_duplicates() {
+    let root = repository(
+        "extract-unused",
+        &[
+            ("src/lib.rs", "pub mod extra;\npub mod kept;\n"),
+            (
+                "src/kept.rs",
+                "fn copy() -> u32 {\n    1 + 2\n}\n\npub fn run() -> u32 {\n    copy()\n}\n",
+            ),
+            ("src/extra.rs", "fn copy() -> u32 {\n    1 + 2\n}\n"),
+        ],
+    );
+    let engine = open(&root);
+    let answer = RefactorSession::read_only()
+        .call(engine.state(), "extract_duplicate", &json!({}))
+        .expect("tool");
+    expect_status(&answer, "NO_EDITS");
+    assert!(answer.get("plan").is_none(), "{answer:?}");
+}
+
+#[test]
+fn extract_window_keeps_cfg_split_copies_apart() {
+    let root = repository(
+        "extract-cfg",
+        &[(
+            "src/lib.rs",
+            "#[cfg(unix)]\nfn enter() -> u32 {\n    let tag = 1;\n    let width: u32 = 1;\n    let height: u32 = 2;\n    let area: u32 = width * height;\n    let padded: u32 = area + height;\n    padded\n}\n\n#[cfg(windows)]\nfn enter() -> u32 {\n    let tag = 2;\n    let width: u32 = 1;\n    let height: u32 = 2;\n    let area: u32 = width * height;\n    let padded: u32 = area + height;\n    padded\n}\n",
+        )],
+    );
+    let engine = open(&root);
+    let answer = RefactorSession::read_only()
+        .call(engine.state(), "extract_window", &json!({}))
+        .expect("tool");
+    expect_status(&answer, "NO_EDITS");
+    assert!(
+        format!("{answer:?}").contains("cfg-split copies stay separate"),
+        "{answer:?}"
+    );
+}
+
+#[test]
+fn extract_window_refuses_a_binding_without_a_written_type() {
+    let root = repository(
+        "extract-untyped",
+        &[(
+            "src/lib.rs",
+            "fn left() -> u32 {\n    let scale = 3;\n    let banner = \"left\";\n    let width: u32 = scale;\n    let height: u32 = 4;\n    let area: u32 = width * height;\n    let padded: u32 = area + height;\n    padded + 1\n}\n\nfn right() -> u32 {\n    let scale = 3;\n    let banner = \"right\";\n    let width: u32 = scale;\n    let height: u32 = 4;\n    let area: u32 = width * height;\n    let padded: u32 = area + height;\n    padded + 2\n}\n",
+        )],
+    );
+    let engine = open(&root);
+    let answer = RefactorSession::read_only()
+        .call(engine.state(), "extract_window", &json!({}))
+        .expect("tool");
+    expect_status(&answer, "NO_EDITS");
+    assert!(
+        format!("{answer:?}").contains("a binding has no written type"),
+        "{answer:?}"
+    );
+}
+
+#[test]
+fn extract_window_lifts_a_typed_run() {
+    let left = "pub fn paint(scale: u32) -> u32 {\n    let banner = \"left\";\n    let width: u32 = scale;\n    let height: u32 = 4;\n    let area: u32 = width * height;\n    let padded: u32 = area + height;\n    banner.len() as u32 + padded\n}\n";
+    let right = "pub fn paint(scale: u32) -> u32 {\n    let banner = \"right\";\n    let width: u32 = scale;\n    let height: u32 = 4;\n    let area: u32 = width * height;\n    let padded: u32 = area + height;\n    banner.len() as u32 + padded + 1\n}\n";
+    let root = repository(
+        "extract-window",
+        &[
+            ("src/lib.rs", "pub mod left;\npub mod right;\n"),
+            ("src/left.rs", left),
+            ("src/right.rs", right),
+        ],
+    );
+    let engine = open(&root);
+    let state = engine.state().clone();
+    let session = RefactorSession::new(true);
+    let answer = session
+        .call(&state, "extract_window", &json!({}))
+        .expect("tool");
+    expect_status(&answer, "PLANNED");
+    let plan = plan_text(&answer);
+    assert!(plan.contains("padded_block"), "{plan}");
+    assert!(plan.contains("pub(crate)"), "{plan}");
+    assert!(plan.contains("crate::left::padded_block"), "{plan}");
+    apply(&session, &state, answer.get("plan").expect("plan"));
+    let left_after = fs::read_to_string(root.join("src/left.rs")).expect("left");
+    let right_after = fs::read_to_string(root.join("src/right.rs")).expect("right");
+    assert!(left_after.contains("fn paint"), "{left_after}");
+    assert!(right_after.contains("fn paint"), "{right_after}");
+    assert!(
+        right_after.contains("crate::left::padded_block(scale)"),
+        "{right_after}"
+    );
+    check_compiles(&root);
+}
+
+#[test]
+fn share_method_body_wraps_both_methods() {
+    let method = "    pub fn duration(&self) -> f64 { (self.end - self.start).max(0.0) }\n";
+    let root = repository(
+        "share-method",
+        &[
+            ("src/lib.rs", "pub mod cue;\npub mod intake;\n"),
+            (
+                "src/cue.rs",
+                &format!(
+                    "pub struct Cue {{\n    start: f64,\n    end: f64,\n}}\n\nimpl Cue {{\n{method}}}\n"
+                ),
+            ),
+            (
+                "src/intake/mod.rs",
+                &format!(
+                    "pub struct Segment {{\n    start: f64,\n    end: f64,\n}}\n\nimpl Segment {{\n{method}}}\n"
+                ),
+            ),
+        ],
+    );
+    let engine = open(&root);
+    let state = engine.state().clone();
+    let session = RefactorSession::new(true);
+    let answer = session
+        .call(&state, "share_method_body", &json!({}))
+        .expect("tool");
+    expect_status(&answer, "PLANNED");
+    let plan = plan_text(&answer);
+    assert!(plan.contains("duration_of"), "{plan}");
+    assert!(plan.contains("pub(crate)"), "{plan}");
+    assert!(plan.contains("crate::cue::duration_of"), "{plan}");
+    let duration = node_id(&state, &NodeKind::Method, "duration");
+    let refused = session
+        .call(&state, "extract_duplicate", &json!({"symbol": duration}))
+        .expect("tool");
+    expect_status(&refused, "NOT_A_SYMBOL");
+    apply(&session, &state, answer.get("plan").expect("plan"));
+    let cue = fs::read_to_string(root.join("src/cue.rs")).expect("cue");
+    let intake = fs::read_to_string(root.join("src/intake/mod.rs")).expect("intake");
+    assert!(cue.contains("fn duration"), "{cue}");
+    assert!(intake.contains("fn duration"), "{intake}");
+    assert!(cue.contains("fn duration_of"), "{cue}");
+    assert!(
+        intake.contains("crate::cue::duration_of(self.end, self.start)"),
+        "{intake}"
+    );
+    check_compiles(&root);
+}
+
+#[test]
+fn share_method_body_keeps_same_type_methods() {
+    let body = "(self.end - self.start).max(0.0)";
+    let root = repository(
+        "share-same",
+        &[(
+            "src/lib.rs",
+            &format!(
+                "pub struct Cue {{\n    start: f64,\n    end: f64,\n}}\n\nimpl Cue {{\n    pub fn duration(&self) -> f64 {{ {body} }}\n    pub fn span(&self) -> f64 {{ {body} }}\n}}\n"
+            ),
+        )],
+    );
+    let engine = open(&root);
+    let answer = RefactorSession::read_only()
+        .call(engine.state(), "share_method_body", &json!({}))
+        .expect("tool");
+    expect_status(&answer, "NO_EDITS");
+    assert!(
+        format!("{answer:?}").contains("same-type methods stay with remove_duplicates"),
+        "{answer:?}"
+    );
+}

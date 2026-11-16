@@ -8,9 +8,10 @@
 //! # The contract is frozen, not re-derived
 //!
 //! The tool names, their schemas and every result state live in
-//! `contract/refactor-tools.v1.json`. Contract version 3 adds `remove_duplicates` and keeps the
-//! result states from version 2. An operation here is conformant when it answers with a status
-//! from that file — never a new one, never a renamed one.
+//! `contract/refactor-tools.v1.json`. Contract version 4 adds `extract_duplicate`,
+//! `extract_window`, and `share_method_body`, and keeps the result states from version 3.
+//! An operation here is conformant when it answers with a status from that file — never a new
+//! one, never a renamed one.
 //!
 //! # Safety boundary
 //!
@@ -38,7 +39,7 @@ pub mod token;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Version of the frozen tool contract this crate implements.
-pub const CONTRACT_VERSION: u32 = 3;
+pub const CONTRACT_VERSION: u32 = 4;
 
 pub use contract::{ResultState, ToolContract};
 pub use operations::{Operation, call, catalog, catalog_names};

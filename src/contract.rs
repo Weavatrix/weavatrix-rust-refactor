@@ -111,8 +111,8 @@ mod tests {
     use super::{catalog_value, declares, permits_state, tools};
 
     #[test]
-    fn the_contract_freezes_thirteen_tools() {
-        assert_eq!(tools().len(), 13);
+    fn the_contract_freezes_sixteen_tools() {
+        assert_eq!(tools().len(), 16);
         for name in [
             "rename_symbol",
             "rename_related_symbols",
@@ -127,6 +127,9 @@ mod tests {
             "delete_readiness",
             "delete_closure",
             "remove_duplicates",
+            "extract_duplicate",
+            "extract_window",
+            "share_method_body",
         ] {
             assert!(declares(name), "{name} is missing from the frozen contract");
         }

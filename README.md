@@ -37,7 +37,8 @@ Unicode-safe edit-plan validation and application.
 
 The tool names, their JSON schemas and the result states live in
 [`contract/refactor-tools.v1.json`](contract/refactor-tools.v1.json). Contract
-version 3 adds `remove_duplicates` and keeps the version 2 result states. That file
+version 4 adds `extract_duplicate`, `extract_window`, and `share_method_body`, and keeps
+the version 3 result states. That file
 is compiled into the crate and is the **only** source of the tool catalog, so this
 implementation cannot drift from the schemas agents already depend on.
 
@@ -50,7 +51,7 @@ is a contract-version decision rather than an implementation detail.
 
 ## Operations
 
-All thirteen are native. Dispatch has no fallback arm, so a tool added to the
+All sixteen are native. Dispatch has no fallback arm, so a tool added to the
 contract fails to compile rather than answering "not supported" at run time.
 
 | Operation | Backend | What it proves |
@@ -61,6 +62,9 @@ contract fails to compile rather than answering "not supported" at run time.
 | `organize_imports` | occurrence count | Named bindings whose identifier occurs once. Rust snake_case, Python from-imports and aliases, Go path segments, Java imports, C# usings, C++ using-names, and Kotlin imports are counted. Traits, `pub use`, bare Python imports, Go blank or dot imports, star imports, C++ `#include`, and `using namespace` stay |
 | `edit_symbol` | declaration range | A symbol-anchored replacement or insertion. The end is the matching brace, the indent block, or the signature line. A signature-line end is `PARTIAL` and warns `DECLARATION_END_UNPROVEN`. Rust is parsed after the edit. A result that does not parse is `INVALID_PLAN` |
 | `remove_duplicates` | exact declaration text | A deletion plan for function and method declarations that match byte for byte, including the name. One copy stays. A used, exported, or dynamically loaded copy stays. The file is parsed after the deletion |
+| `extract_duplicate` | exact declaration text | A used exact duplicate function. The earliest non-exported Rust copy stays and proven calls of the later copies are retargeted. An unused family stays with `remove_duplicates`. A method stays with `share_method_body` |
+| `extract_window` | straight-line statements | A repeated Rust statement window of at least four lines that is not a whole declaration. Every free name needs a written type. Copies under different `cfg` attributes stay separate |
+| `share_method_body` | identical method bodies | A helper for the same body on different types. Both methods stay as wrappers. The helper takes the fields the body reads. Same-type methods stay with `remove_duplicates` |
 | `bulk_replace` | lexical | Literal or regex matches in indexed code. Comments and strings are included only with `include_trivia`. An extension the tokenizer does not know still skips `//` comments, block comments, quotes, and a `#` that starts a line |
 | `move_file` | specifier arithmetic | The filesystem rename and the relative import specifiers, in one transaction. A missing parent directory is created at apply and removed on rollback when it is empty. A non-relative specifier whose last segment is the moved file is reported and the plan stays partial |
 | `move_symbol` | graph | A cycle review plus an edit plan that moves the declaration, retargets the imports it can prove, and copies the imports the declaration uses. The status stays `EVALUATED` |
