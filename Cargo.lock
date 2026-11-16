@@ -924,10 +924,11 @@ dependencies = [
 
 [[package]]
 name = "weavatrix-rust-refactor"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "blazingly-json",
  "regex",
+ "syn",
  "tempfile",
  "weavatrix-graph",
  "weavatrix-parse",

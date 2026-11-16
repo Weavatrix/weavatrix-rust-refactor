@@ -1,11 +1,11 @@
 {
-  "contractVersion": 2,
+  "contractVersion": 3,
   "frozenFrom": {
     "package": "weavatrix-refactor-js",
     "version": "0.1.7",
     "engine": "^0.3.15"
   },
-  "note": "Version 1 was recorded from the shipping JavaScript implementation. Version 2 adds delete_closure and keeps the same result states. A Rust host is conformant when it exposes exactly these tool names with these schemas, and never emits a status outside resultStates. Additions require a contract version bump.",
+  "note": "Version 1 was recorded from the shipping JavaScript implementation. Version 2 adds delete_closure and keeps the same result states. Version 3 adds remove_duplicates and keeps those result states. A Rust host is conformant when it exposes exactly these tool names with these schemas, and never emits a status outside resultStates. Additions require a contract version bump.",
   "tools": [
     {
       "name": "rename_symbol",
@@ -413,6 +413,29 @@
         "required": [
           "symbol"
         ]
+      }
+    },
+    {
+      "name": "remove_duplicates",
+      "description": "Plan deletion of exact duplicate function or method declarations. The declaration text, including the name, must match byte for byte. One copy stays. A copy another symbol still uses, an exported copy, and a copy whose body can load code dynamically stay. The file is parsed after the deletion; a result that does not parse is not planned. Returns an edit plan and does not write. Apply it with apply_edit_plan. Pass symbol to limit the plan to that declaration's duplicates.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "description": "Optional exact symbol id. When set, only duplicates of this function or method are planned."
+          },
+          "output_format": {
+            "type": "string",
+            "enum": [
+              "text",
+              "json"
+            ],
+            "default": "text",
+            "description": "text returns concise TextContent; json also returns the stable structuredContent envelope"
+          }
+        },
+        "required": []
       }
     }
   ],

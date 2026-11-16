@@ -1,6 +1,6 @@
 //! The refactor operation surface.
 //!
-//! Dispatch is total and every arm is a native engine — all twelve of the frozen tools answer
+//! Dispatch is total and every arm is a native engine — all thirteen of the frozen tools answer
 //! for themselves, and the match has no fallback arm, so adding a tool to the contract fails to
 //! compile rather than quietly returning "not supported" at run time.
 //!
@@ -20,9 +20,11 @@ mod move_file;
 mod move_imports;
 mod move_symbol;
 mod organize_imports;
+mod remove_duplicates;
 mod rename_related;
 mod rename_symbol;
 mod signature;
+mod syntax_gate;
 mod text_scan;
 
 use crate::contract;
@@ -64,7 +66,8 @@ impl RefactorSession {
     ///
     /// The repository lock is taken before the operation reads or writes. Readers share it. A
     /// call that will apply or roll back takes it alone when the write gate is open. A
-    /// conflicting lock is `REPO_BUSY` and does not spend a confirm token.
+    /// conflicting lock on that same repository is `REPO_BUSY` and does not spend a confirm
+    /// token. Any other repository runs at the same time.
     ///
     /// # Errors
     ///
@@ -110,6 +113,7 @@ impl RefactorSession {
             }
             Operation::ChangeSignature => change_signature::change_signature(state, arguments),
             Operation::DeleteClosure => delete_closure::delete_closure(state, arguments),
+            Operation::RemoveDuplicates => remove_duplicates::remove_duplicates(state, arguments),
         })
     }
 }
@@ -129,6 +133,7 @@ pub enum Operation {
     MoveSymbol,
     DeleteReadiness,
     DeleteClosure,
+    RemoveDuplicates,
 }
 
 impl Operation {
@@ -148,6 +153,7 @@ impl Operation {
             "move_symbol" => Some(Self::MoveSymbol),
             "delete_readiness" => Some(Self::DeleteReadiness),
             "delete_closure" => Some(Self::DeleteClosure),
+            "remove_duplicates" => Some(Self::RemoveDuplicates),
             _ => None,
         }
     }
@@ -183,6 +189,7 @@ impl Operation {
             Self::MoveSymbol => "move_symbol",
             Self::DeleteReadiness => "delete_readiness",
             Self::DeleteClosure => "delete_closure",
+            Self::RemoveDuplicates => "remove_duplicates",
         }
     }
 }
@@ -190,7 +197,8 @@ impl Operation {
 /// Holds one repository while a call reads or writes it.
 ///
 /// Dropping the guard releases the lock. The same thread may acquire it again; another
-/// thread or process gets `REPO_BUSY` instead of waiting.
+/// thread or process on that same repository gets `REPO_BUSY` instead of waiting. Any other
+/// repository runs at the same time.
 #[must_use = "dropping the guard releases the repository"]
 pub struct RepositoryGuard {
     _lock: journal::RepoLock,
@@ -204,9 +212,9 @@ pub struct RepositoryGuard {
 ///
 /// # Errors
 ///
-/// Returns `REPO_BUSY` when another process holds a conflicting lock, when this thread is
-/// already inside a different repository, or when a read on this thread would have to become
-/// a write.
+/// Returns `REPO_BUSY` when another process holds a conflicting lock on this repository,
+/// when this thread is already inside a different repository, or when a read on this thread
+/// would have to become a write.
 pub fn repository_guard(
     root: &Path,
     name: &str,

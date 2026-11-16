@@ -215,10 +215,12 @@ fn busy(reason: impl Into<String>) -> Value {
 
 /// The repository lock for one call.
 ///
-/// Readers share it. A writer takes it alone, so a second process cannot observe a file
-/// halfway through an apply. The same thread can take it again: the host holds it across the
-/// graph refresh, and the write then takes it before spending a confirm token. A crash closes
-/// the handle and releases the lock. The file itself stays.
+/// Readers of this repository share it. A writer of this repository takes it alone, so a
+/// second process cannot observe a file halfway through an apply. Any other repository,
+/// including a parent, a child, or a sibling, takes its own lock and runs at the same time.
+/// The same thread can take this lock again: the host holds it across the graph refresh,
+/// and the write then takes it before spending a confirm token. A crash closes the handle
+/// and releases the lock. The file itself stays.
 ///
 /// The guard stays on the thread that took it. Sending it elsewhere would drop the wrong
 /// thread-local and leave the file locked.
@@ -430,5 +432,41 @@ mod tests {
         assert_eq!(other_thread(&root, true), "REPO_BUSY");
         drop(outer);
         assert_eq!(other_thread(&root, false), "ok");
+    }
+
+    fn nested(parent: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let path = parent.join(name);
+        std::fs::create_dir_all(&path).expect("nested directory");
+        path
+    }
+
+    #[test]
+    fn one_hundred_repositories_lock_together() {
+        let parent = root("hundred");
+        let mut paths = vec![parent.clone()];
+        for index in 0..99 {
+            paths.push(nested(&parent, &format!("repo-{index}")));
+        }
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(paths.len()));
+        let mut handles = Vec::new();
+        for path in paths {
+            let ready = std::sync::Arc::clone(&ready);
+            handles.push(std::thread::spawn(move || {
+                let lock = acquire(&path, true);
+                let status = lock.is_ok();
+                ready.wait();
+                drop(lock);
+                status
+            }));
+        }
+        for handle in handles {
+            assert!(handle.join().expect("worker"));
+        }
+        let lock_file = parent.join(".weavatrix").join("refactor-write.lock");
+        assert!(lock_file.is_file());
+        assert_eq!(
+            std::fs::metadata(&lock_file).expect("lock metadata").len(),
+            0
+        );
     }
 }

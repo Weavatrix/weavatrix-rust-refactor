@@ -436,7 +436,85 @@ fn edit_symbol_plans_a_rust_body() {
         )
         .expect("tool");
     expect_status(&answer, "PLANNED");
+    assert_eq!(
+        answer.get("completeness").and_then(Value::as_str),
+        Some("COMPLETE"),
+        "{answer:?}"
+    );
     assert!(answer.get("plan").is_some(), "{answer:?}");
+    let warnings = answer
+        .get("warnings")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    assert!(
+        !warnings.contains(&"SYNTAX_CHECK_NOT_PERFORMED"),
+        "{answer:?}"
+    );
+}
+
+#[test]
+fn edit_symbol_refuses_a_body_that_does_not_parse() {
+    let root = repository(
+        "edit-syntax",
+        &[(
+            "src/lib.rs",
+            "pub fn used(value: u32) -> u32 {\n    value\n}\n",
+        )],
+    );
+    let engine = open(&root);
+    let id = node_id(engine.state(), &NodeKind::Function, "used");
+    let answer = RefactorSession::read_only()
+        .call(
+            engine.state(),
+            "edit_symbol",
+            &json!({
+                "symbol": id,
+                "operation": "replace_symbol_body",
+                "content": "pub fn used( {",
+            }),
+        )
+        .expect("tool");
+    expect_status(&answer, "INVALID_PLAN");
+    assert!(answer.get("plan").is_none(), "{answer:?}");
+}
+
+#[test]
+fn remove_duplicates_plans_only_the_unused_exact_copy() {
+    let root = repository(
+        "dedupe",
+        &[
+            ("src/lib.rs", "pub mod extra;\npub mod kept;\n"),
+            (
+                "src/kept.rs",
+                "fn copy() -> u32 {\n    1 + 2\n}\n\npub fn run() -> u32 {\n    copy()\n}\n",
+            ),
+            ("src/extra.rs", "fn copy() -> u32 {\n    1 + 2\n}\n"),
+        ],
+    );
+    let engine = open(&root);
+    let answer = RefactorSession::read_only()
+        .call(engine.state(), "remove_duplicates", &json!({}))
+        .expect("tool");
+    expect_status(&answer, "PLANNED");
+    let deleted = answer
+        .get("deleted")
+        .and_then(Value::as_array)
+        .expect("deleted");
+    assert_eq!(deleted.len(), 1, "{answer:?}");
+    assert_eq!(
+        deleted[0].get("file").and_then(Value::as_str),
+        Some("src/extra.rs"),
+        "{answer:?}"
+    );
+    let preview = RefactorSession::read_only()
+        .call(
+            engine.state(),
+            "apply_edit_plan",
+            &json!({"plan": answer.get("plan").expect("plan").clone()}),
+        )
+        .expect("preview");
+    expect_status(&preview, "PREVIEW_OK");
 }
 
 #[test]

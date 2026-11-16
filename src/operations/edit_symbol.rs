@@ -1,10 +1,11 @@
 //! Symbol-anchored edits: replace a declaration's body, or insert around it.
 //!
 //! The anchor is the parser range the graph recorded, so this never guesses where a declaration
-//! begins. What it cannot do is check that the result still parses — the native engine has no
-//! syntax gate yet — so every plan carries that limit as a warning rather than implying a
-//! correctness it did not verify.
+//! begins. The file is parsed again after the edit. Rust goes through `syn`. Other tokenized
+//! languages are checked for an unterminated literal and for unmatched delimiters. A result that
+//! does not parse is refused. A language with no checker stays `PARTIAL`.
 
+use super::syntax_gate::{self, Syntax};
 use crate::coordinates::utf16_offset;
 use crate::declaration::locate;
 use crate::evidence::{declaring_file, read_source};
@@ -124,6 +125,13 @@ pub(super) fn edit_symbol(state: &RepositoryState, arguments: &Value) -> Value {
         "insert_before_symbol" => ((declaration.start, declaration.start), String::new()),
         _ => ((declaration.end, declaration.end), String::new()),
     };
+    let Some(rewritten) = syntax_gate::rewrite(&source, range.0, range.1, content) else {
+        return super::stale_graph(&file);
+    };
+    let checked = syntax_gate::check(&file, &rewritten);
+    if let Syntax::Refused(refusal) = checked {
+        return refusal;
+    }
 
     let (Some(start_position), Some(end_position)) =
         (position_of(&source, range.0), position_of(&source, range.1))
@@ -152,20 +160,21 @@ pub(super) fn edit_symbol(state: &RepositoryState, arguments: &Value) -> Value {
         )
         .build();
 
-    let proven = declaration.end_proven;
-    let warnings = if proven {
-        vec!["SYNTAX_CHECK_NOT_PERFORMED"]
-    } else {
-        vec!["SYNTAX_CHECK_NOT_PERFORMED", "DECLARATION_END_UNPROVEN"]
-    };
+    let proven = declaration.end_proven && matches!(checked, Syntax::Proven);
+    let mut warnings = Vec::new();
+    if !matches!(checked, Syntax::Proven) {
+        warnings.push("SYNTAX_CHECK_NOT_PERFORMED");
+    }
+    if !declaration.end_proven {
+        warnings.push("DECLARATION_END_UNPROVEN");
+    }
     json!({
         "status": "PLANNED",
         "completeness": if proven { "COMPLETE" } else { "PARTIAL" },
         "symbol": label,
         "plan": plan,
         "warnings": warnings,
-        "next": "apply with apply_edit_plan (preview -> confirm). The native engine does not \
-                 syntax-check the result, so review it or run the project's own build.",
+        "next": "apply with apply_edit_plan (preview -> confirm).",
     })
 }
 
@@ -276,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn the_missing_syntax_gate_is_stated_rather_than_implied() {
+    fn a_parsed_insertion_does_not_warn_that_syntax_was_skipped() {
         let state = fixture_state();
         let answer = edit_symbol(
             &state,
@@ -292,8 +301,22 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.as_str() == Some("SYNTAX_CHECK_NOT_PERFORMED")),
-            "a plan that was not syntax-checked must say so"
+                .all(|warning| warning.as_str() != Some("SYNTAX_CHECK_NOT_PERFORMED")),
+            "a parsed result must not claim the check was skipped: {answer:?}"
         );
+    }
+
+    #[test]
+    fn a_body_that_does_not_parse_is_refused() {
+        let state = fixture_state();
+        let answer = edit_symbol(
+            &state,
+            &json!({"symbol": "used", "operation": "replace_symbol_body", "content": "pub fn used( {"}),
+        );
+        if status(&answer) == "NOT_FOUND" {
+            return;
+        }
+        assert_eq!(status(&answer), "INVALID_PLAN", "{answer:?}");
+        assert!(answer.get("plan").is_none(), "{answer:?}");
     }
 }

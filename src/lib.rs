@@ -8,17 +8,18 @@
 //! # The contract is frozen, not re-derived
 //!
 //! The tool names, their schemas and every result state live in
-//! `contract/refactor-tools.v1.json`. Contract version 2 adds `delete_closure` and keeps the
-//! result states from version 1. An operation here is conformant when it answers with a status
+//! `contract/refactor-tools.v1.json`. Contract version 3 adds `remove_duplicates` and keeps the
+//! result states from version 2. An operation here is conformant when it answers with a status
 //! from that file — never a new one, never a renamed one.
 //!
 //! # Safety boundary
 //!
 //! Producing a plan is a read. Applying one requires all three gates: the host exposes the edit
 //! capability, `WEAVATRIX_ALLOW_SOURCE_EDITS=1` is set, and the call presents a single-use token
-//! bound to that exact plan and repository. Every call takes a repository lock first: readers
-//! share it, and a writer takes it alone. A busy repository answers `REPO_BUSY` before a confirm
-//! token is spent. Nothing in this crate writes source without the three gates.
+//! bound to that exact plan and repository. Every call takes that repository's lock first:
+//! readers share it, and a writer takes it alone. Any other repository runs at the same time.
+//! A busy repository answers `REPO_BUSY` before a confirm token is spent. Nothing in this crate
+//! writes source without the three gates.
 
 pub mod contract;
 pub mod coordinates;
@@ -37,7 +38,7 @@ pub mod token;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Version of the frozen tool contract this crate implements.
-pub const CONTRACT_VERSION: u32 = 2;
+pub const CONTRACT_VERSION: u32 = 3;
 
 pub use contract::{ResultState, ToolContract};
 pub use operations::{Operation, call, catalog, catalog_names};

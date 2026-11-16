@@ -37,7 +37,7 @@ Unicode-safe edit-plan validation and application.
 
 The tool names, their JSON schemas and the result states live in
 [`contract/refactor-tools.v1.json`](contract/refactor-tools.v1.json). Contract
-version 2 adds `delete_closure` and keeps the version 1 result states. That file
+version 3 adds `remove_duplicates` and keeps the version 2 result states. That file
 is compiled into the crate and is the **only** source of the tool catalog, so this
 implementation cannot drift from the schemas agents already depend on.
 
@@ -50,7 +50,7 @@ is a contract-version decision rather than an implementation detail.
 
 ## Operations
 
-All twelve are native. Dispatch has no fallback arm, so a tool added to the
+All thirteen are native. Dispatch has no fallback arm, so a tool added to the
 contract fails to compile rather than answering "not supported" at run time.
 
 | Operation | Backend | What it proves |
@@ -59,7 +59,8 @@ contract fails to compile rather than answering "not supported" at run time.
 | `rename_related_symbols` | the same, merged | One transaction for several renames, with collision and contested-site detection; chains and swaps apply simultaneously rather than in sequence |
 | `change_signature` | graph + token-split lists | A parameter added or removed in any indexed language, including Kotlin read with the Java tokenizer. A typed language copies the previous parameter's type. With a default, existing calls stay. Without one, proven calls are edited when a call-site value is given. A call the graph missed is edited only when the name is declared once and its argument list can be read; otherwise it is listed. The result stays `PARTIAL` |
 | `organize_imports` | occurrence count | Named bindings whose identifier occurs once. Rust snake_case, Python from-imports and aliases, Go path segments, Java imports, C# usings, C++ using-names, and Kotlin imports are counted. Traits, `pub use`, bare Python imports, Go blank or dot imports, star imports, C++ `#include`, and `using namespace` stay |
-| `edit_symbol` | declaration range | A symbol-anchored replacement or insertion. The end is the matching brace, the indent block, or the signature line. A signature-line end is `PARTIAL` and warns `DECLARATION_END_UNPROVEN`. The plan warns that syntax was not checked |
+| `edit_symbol` | declaration range | A symbol-anchored replacement or insertion. The end is the matching brace, the indent block, or the signature line. A signature-line end is `PARTIAL` and warns `DECLARATION_END_UNPROVEN`. Rust is parsed after the edit. A result that does not parse is `INVALID_PLAN` |
+| `remove_duplicates` | exact declaration text | A deletion plan for function and method declarations that match byte for byte, including the name. One copy stays. A used, exported, or dynamically loaded copy stays. The file is parsed after the deletion |
 | `bulk_replace` | lexical | Literal or regex matches in indexed code. Comments and strings are included only with `include_trivia`. An extension the tokenizer does not know still skips `//` comments, block comments, quotes, and a `#` that starts a line |
 | `move_file` | specifier arithmetic | The filesystem rename and the relative import specifiers, in one transaction. A missing parent directory is created at apply and removed on rollback when it is empty. A non-relative specifier whose last segment is the moved file is reported and the plan stays partial |
 | `move_symbol` | graph | A cycle review plus an edit plan that moves the declaration, retargets the imports it can prove, and copies the imports the declaration uses. The status stays `EVALUATED` |
@@ -106,8 +107,9 @@ Producing a plan is a read. Applying one requires all three gates: the host
 exposes the edit capability, `WEAVATRIX_ALLOW_SOURCE_EDITS=1` is set, and the call
 presents a single-use token bound to that exact plan and repository. Source
 bytes go through weavatrix-worktree. Two control files under `.weavatrix`
-record apply order and the cross-process lock. Readers share that lock. A writer
-returns `REPO_BUSY` to other processes, and an apply that finds the repository
+record apply order and the cross-process lock. Readers of that repository share
+the lock. A writer returns `REPO_BUSY` to other processes on the same repository.
+Any other repository runs at the same time. An apply that finds the repository
 busy keeps its confirm token. An empty directory created for a rename is removed
 on rollback.
 
